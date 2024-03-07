@@ -2,7 +2,7 @@
 
 Introduction
 Welcome to the "Custom Automation in MicroStrategy" guide. This space is dedicated to exploring the dynamic world of automation within the MicroStrategy platform. Custom automation can dramatically improve efficiency, accuracy, and productivity in data analytics, making it a valuable skill for any MicroStrategy user.
-
+Welcome to "Custom Automation in MicroStrategy," where we explore enhancing MicroStrategy with external tools like PowerShell and Autosys. This space focuses on innovative, efficient automation solutions to extend MicroStrategy's capabilities beyond its native features. Dive into practical use cases, from refreshing Intelligent Cubes to streamlining data processes, and discover how to optimize your MicroStrategy environment with custom automation techniques.
 Understanding Automation in MicroStrategy
 Automation in MicroStrategy involves using scripts or tools to automate repetitive tasks, such as data loading, report generation, or cube refreshing. This not only saves time but also reduces human error, leading to more reliable data insights.
 
