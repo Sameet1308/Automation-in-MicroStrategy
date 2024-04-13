@@ -1,0 +1,32 @@
+Sure, here's the content you can use to create a Confluence page about extracting data lineage from MicroStrategy cubes:
+Extracting Data Lineage from MicroStrategy Cubes
+This page explains how to extract data lineage from MicroStrategy cubes to understand their dependencies on underlying database tables and columns. This information can be used to improve data management, enhance data quality, and streamline data governance.
+Benefits
+ * Identify redundant cubes and datasets based on shared tables and columns.
+ * Consolidate cubes with identical functionalities.
+ * Analyze extracted SQL to design optimal data models.
+ * Prioritize tables for cloud migration or SQL optimization based on cube dependencies.
+ * Facilitate data migration and future technology stack changes with clear data lineage.
+ * Maintain data transparency for regulatory compliance.
+Who Benefits
+ * Data Analysts: Understand data dependencies for impact analysis on cubes and underlying tables.
+ * Data Architects: Identify opportunities for data model optimization based on data lineage.
+ * Data Engineers: Prioritize tables for cloud migration or SQL optimization based on cube usage.
+ * IT Teams: Ensure data integrity during system migrations by understanding cube dependencies.
+Process Overview
+ * Connect to MicroStrategy API (Python): Use Python libraries like mstrio to connect to the MicroStrategy environment using its REST API.
+ * Enumerate Cubes in Project: Enumerate all the cubes within the chosen MicroStrategy project.
+ * Extract SQL for Each Cube: Extract the corresponding SQL query that defines each cube's data source and transformations.
+ * Parse SQL for Tables and Columns: Employ techniques like regular expressions or SQL parsing libraries to identify the tables and columns referenced within the extracted SQL queries.
+ * Map Tables and Columns to Cubes: Establish relationships between the cubes, the tables and columns they utilize, forming a comprehensive data lineage map.
+Future Action Items
+ * Refine SQL parsing to handle complex queries for accurate data lineage extraction of tables and columns.
+ * Integrate with data dictionary validation to ensure extracted table and column names are accurate.
+ * Implement a feedback loop for users to report parsing errors or inaccuracies for continuous improvement.
+Tools and Technologies
+ * Python
+ * mstrio library (or equivalent)
+ * SQL parsing libraries (regular expressions, ANTLR, etc.)
+Next Steps
+ * Refer to the "Data Lineage Extraction Workflow" section for a detailed breakdown of the process.
+ * Explore the provided resources (if any) to delve deeper into specific aspects of data lineage extraction from MicroStrategy cubes.
