@@ -1,60 +1,67 @@
 from pyspark.sql import SparkSession
 
-# ----------------------------------------------------
-# Configuration (update these paths accordingly)
-# ----------------------------------------------------
+# -------------------------------------
+# 1. Configuration: Replace these paths
+# -------------------------------------
 raw_csv_path = "s3://your-raw-bucket/path/to/lu_servicingoverview.csv"
 clean_parquet_path = "s3://your-consumption-bucket/lu_servicingoverview_cleaned/"
 glue_database = "your_glue_db"
 glue_table_name = "lu_servicingoverview"
 
-# ----------------------------------------------------
-# Spark session (Databricks auto-configures this)
-# ----------------------------------------------------
+# -------------------------------------
+# 2. Create Spark session (Databricks will already have one)
+# -------------------------------------
 spark = SparkSession.builder.appName("CSVToGlueTable").getOrCreate()
 
-# ----------------------------------------------------
-# Step 1: Read raw CSV from S3 with proper handling
-# ----------------------------------------------------
+# -------------------------------------
+# 3. Read raw CSV from S3 with robust options
+# -------------------------------------
 df = spark.read.format("csv") \
     .option("header", "true") \
-    .option("inferSchema", "true") \
+    .option("multiLine", "true") \
     .option("quote", "\"") \
     .option("escape", "\"") \
-    .option("multiLine", "true") \
     .option("delimiter", ",") \
     .option("ignoreLeadingWhiteSpace", "true") \
     .option("ignoreTrailingWhiteSpace", "true") \
     .load(raw_csv_path)
 
-# ----------------------------------------------------
-# Step 2: Display the data for confirmation
-# ----------------------------------------------------
-print("✅ Previewing parsed data from CSV:")
+print("✅ Preview raw CSV content:")
 df.show(truncate=False)
 
-# ----------------------------------------------------
-# Step 3: Write to Parquet in clean S3 location
-# ----------------------------------------------------
+# -------------------------------------
+# 4. Write cleaned data to S3 as Parquet
+# -------------------------------------
 df.write.mode("overwrite").parquet(clean_parquet_path)
-print(f"✅ Parquet written to {clean_parquet_path}")
+print(f"✅ Cleaned Parquet data written to {clean_parquet_path}")
 
-# ----------------------------------------------------
-# Step 4: Create Glue-compatible external table
-# ----------------------------------------------------
+# -------------------------------------
+# 5. Read back the cleaned Parquet data
+# -------------------------------------
+df_cleaned = spark.read.parquet(clean_parquet_path)
+
+print("✅ Preview data from cleaned S3 prefix:")
+df_cleaned.show(truncate=False)
+df_cleaned.printSchema()
+
+# -------------------------------------
+# 6. Create Glue-compatible external table
+# -------------------------------------
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {glue_database}")
+spark.sql(f"DROP TABLE IF EXISTS {glue_database}.{glue_table_name}")
 
 spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {glue_database}.{glue_table_name}
+CREATE TABLE {glue_database}.{glue_table_name}
 USING PARQUET
 LOCATION '{clean_parquet_path}'
 """)
 
-print(f"✅ Glue table {glue_database}.{glue_table_name} created successfully.")
+print(f"✅ Glue table {glue_database}.{glue_table_name} created at: {clean_parquet_path}")
 
-# ----------------------------------------------------
-# Step 5: Validate final Glue table content
-# ----------------------------------------------------
-print("✅ Validating data from Glue table:")
-df2 = spark.sql(f"SELECT * FROM {glue_database}.{glue_table_name}")
-df2.show(truncate=False)
+# -------------------------------------
+# 7. Query the Glue table to confirm it works
+# -------------------------------------
+df_glue = spark.sql(f"SELECT * FROM {glue_database}.{glue_table_name}")
+
+print("✅ Final Glue Table Output:")
+df_glue.show(truncate=False)
