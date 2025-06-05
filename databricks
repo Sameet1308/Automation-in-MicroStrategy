@@ -1,20 +1,20 @@
 from pyspark.sql import SparkSession
 
 # -------------------------------------
-# 1. Configuration: Replace these paths
+# 1. Configuration (Update with your actual paths and DB)
 # -------------------------------------
-raw_csv_path = "s3://your-raw-bucket/path/to/lu_servicingoverview.csv"
-clean_parquet_path = "s3://your-consumption-bucket/lu_servicingoverview_cleaned/"
+raw_csv_path = "s3://your-raw-bucket/path/to/confidential_file.csv"
+clean_parquet_path = "s3://your-consumption-bucket/path/cleaned_output/"
 glue_database = "your_glue_db"
-glue_table_name = "lu_servicingoverview"
+glue_table_name = "confidential_table"
 
 # -------------------------------------
-# 2. Create Spark session (Databricks will already have one)
+# 2. Spark session
 # -------------------------------------
 spark = SparkSession.builder.appName("CSVToGlueTable").getOrCreate()
 
 # -------------------------------------
-# 3. Read raw CSV from S3 with robust options
+# 3. Read raw CSV with robust config
 # -------------------------------------
 df = spark.read.format("csv") \
     .option("header", "true") \
@@ -26,23 +26,48 @@ df = spark.read.format("csv") \
     .option("ignoreTrailingWhiteSpace", "true") \
     .load(raw_csv_path)
 
-print("✅ Preview raw CSV content:")
-df.show(truncate=False)
+print("✅ Raw CSV Schema:")
+df.printSchema()
+
+# ✅ Visual check of raw data
+print("✅ Previewing raw CSV:")
+display(df.limit(5))
 
 # -------------------------------------
-# 4. Write cleaned data to S3 as Parquet
+# 4. Reorder columns (MASKED VERSION)
 # -------------------------------------
-df.write.mode("overwrite").parquet(clean_parquet_path)
-print(f"✅ Cleaned Parquet data written to {clean_parquet_path}")
+ordered_columns = [
+    "col_01",
+    "col_02",
+    "col_03",
+    "col_04",
+    "col_05",
+    "col_06",
+    "col_07",
+    "col_08",
+    "col_09",
+    "col_10",
+    "col_11",
+    "col_12",
+    "col_13",
+    "col_14",
+    "col_15",
+    "col_16",
+    "col_17",
+    "col_18"
+]
+
+df_cleaned = df.select([col for col in ordered_columns])
+
+# ✅ Visual check of cleaned/reordered data
+print("✅ Previewing cleaned and ordered data:")
+display(df_cleaned.limit(5))
 
 # -------------------------------------
-# 5. Read back the cleaned Parquet data
+# 5. Write to Parquet in clean S3 location
 # -------------------------------------
-df_cleaned = spark.read.parquet(clean_parquet_path)
-
-print("✅ Preview data from cleaned S3 prefix:")
-df_cleaned.show(truncate=False)
-df_cleaned.printSchema()
+df_cleaned.write.mode("overwrite").parquet(clean_parquet_path)
+print(f"✅ Parquet written to: {clean_parquet_path}")
 
 # -------------------------------------
 # 6. Create Glue-compatible external table
@@ -55,13 +80,17 @@ CREATE TABLE {glue_database}.{glue_table_name}
 USING PARQUET
 LOCATION '{clean_parquet_path}'
 """)
-
-print(f"✅ Glue table {glue_database}.{glue_table_name} created at: {clean_parquet_path}")
+print(f"✅ Glue table created: {glue_database}.{glue_table_name}")
 
 # -------------------------------------
-# 7. Query the Glue table to confirm it works
+# 7. Read back from Glue table and verify
 # -------------------------------------
 df_glue = spark.sql(f"SELECT * FROM {glue_database}.{glue_table_name}")
 
-print("✅ Final Glue Table Output:")
-df_glue.show(truncate=False)
+# ✅ Final check of Glue table content
+print("✅ Previewing data from Glue table:")
+display(df_glue.limit(5))
+
+# ✅ Optional: Verify round-trip data match
+print("✅ Row count match:", df_cleaned.count() == df_glue.count())
+df_cleaned.exceptAll(df_glue).show(truncate=False)
