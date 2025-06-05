@@ -1,7 +1,8 @@
 from pyspark.sql import SparkSession
+import re
 
 # -------------------------------------
-# 1. Configuration (Update with your actual paths and DB)
+# 1. Configuration (update with your real paths and DB/table names)
 # -------------------------------------
 raw_csv_path = "s3://your-raw-bucket/path/to/confidential_file.csv"
 clean_parquet_path = "s3://your-consumption-bucket/path/cleaned_output/"
@@ -9,12 +10,12 @@ glue_database = "your_glue_db"
 glue_table_name = "confidential_table"
 
 # -------------------------------------
-# 2. Spark session
+# 2. Start Spark session
 # -------------------------------------
-spark = SparkSession.builder.appName("CSVToGlueTable").getOrCreate()
+spark = SparkSession.builder.appName("CSVToGlueTableCleaned").getOrCreate()
 
 # -------------------------------------
-# 3. Read raw CSV with robust config
+# 3. Read raw CSV with correct options
 # -------------------------------------
 df = spark.read.format("csv") \
     .option("header", "true") \
@@ -29,48 +30,38 @@ df = spark.read.format("csv") \
 print("✅ Raw CSV Schema:")
 df.printSchema()
 
-# ✅ Visual check of raw data
 print("✅ Previewing raw CSV:")
 display(df.limit(5))
 
 # -------------------------------------
-# 4. Reorder columns (MASKED VERSION)
+# 4. Clean column names (remove ()[]{} newline, spaces, special chars)
 # -------------------------------------
-ordered_columns = [
-    "col_01",
-    "col_02",
-    "col_03",
-    "col_04",
-    "col_05",
-    "col_06",
-    "col_07",
-    "col_08",
-    "col_09",
-    "col_10",
-    "col_11",
-    "col_12",
-    "col_13",
-    "col_14",
-    "col_15",
-    "col_16",
-    "col_17",
-    "col_18"
-]
+def clean_column_name(col_name):
+    return re.sub(r'[^a-zA-Z0-9_]', '_', col_name.strip()).lower()
 
-df_cleaned = df.select([col for col in ordered_columns])
+cleaned_columns = [clean_column_name(col) for col in df.columns]
+df_cleaned = df.toDF(*cleaned_columns)
 
-# ✅ Visual check of cleaned/reordered data
+print("✅ Cleaned column names:")
+print(df_cleaned.columns)
+
+# -------------------------------------
+# 5. Reorder columns alphabetically (or keep custom order if known)
+# -------------------------------------
+ordered_columns = sorted(df_cleaned.columns)
+df_cleaned = df_cleaned.select(ordered_columns)
+
 print("✅ Previewing cleaned and ordered data:")
 display(df_cleaned.limit(5))
 
 # -------------------------------------
-# 5. Write to Parquet in clean S3 location
+# 6. Write to Parquet in clean S3 path
 # -------------------------------------
 df_cleaned.write.mode("overwrite").parquet(clean_parquet_path)
-print(f"✅ Parquet written to: {clean_parquet_path}")
+print(f"✅ Cleaned Parquet written to: {clean_parquet_path}")
 
 # -------------------------------------
-# 6. Create Glue-compatible external table
+# 7. Create Glue-compatible external table
 # -------------------------------------
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {glue_database}")
 spark.sql(f"DROP TABLE IF EXISTS {glue_database}.{glue_table_name}")
@@ -83,14 +74,14 @@ LOCATION '{clean_parquet_path}'
 print(f"✅ Glue table created: {glue_database}.{glue_table_name}")
 
 # -------------------------------------
-# 7. Read back from Glue table and verify
+# 8. Read and display final Glue table output
 # -------------------------------------
 df_glue = spark.sql(f"SELECT * FROM {glue_database}.{glue_table_name}")
-
-# ✅ Final check of Glue table content
-print("✅ Previewing data from Glue table:")
+print("✅ Final Glue Table Output:")
 display(df_glue.limit(5))
 
-# ✅ Optional: Verify round-trip data match
+# -------------------------------------
+# 9. Optional: Integrity check
+# -------------------------------------
 print("✅ Row count match:", df_cleaned.count() == df_glue.count())
 df_cleaned.exceptAll(df_glue).show(truncate=False)
