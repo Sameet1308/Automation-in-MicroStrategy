@@ -1,0 +1,60 @@
+from pyspark.sql import SparkSession
+
+# ----------------------------------------------------
+# Configuration: Set your raw input & cleaned output S3 paths
+# ----------------------------------------------------
+raw_csv_path = "s3://your-raw-bucket/path/to/exclusive_file.csv"
+consumption_parquet_path = "s3://your-consumption-bucket/path/cleaned-exclusive-output/"
+glue_database = "your_glue_database"
+glue_table_name = "exclusive_table"
+
+# ----------------------------------------------------
+# Initialize Spark session (Databricks auto-configures this)
+# ----------------------------------------------------
+spark = SparkSession.builder.appName("CSVToGlueTable").getOrCreate()
+
+# ----------------------------------------------------
+# Step 1: Read the raw CSV from S3 (handle multiline, quotes, commas)
+# ----------------------------------------------------
+df = spark.read.format("csv") \
+    .option("header", "true") \
+    .option("inferSchema", "true") \
+    .option("quote", "\"") \
+    .option("escape", "\"") \
+    .option("multiLine", "true") \
+    .option("delimiter", ",") \
+    .option("ignoreLeadingWhiteSpace", "true") \
+    .option("ignoreTrailingWhiteSpace", "true") \
+    .load(raw_csv_path)
+
+# ----------------------------------------------------
+# Step 2: Display records for manual validation
+# (Use display(df) only in Databricks notebook)
+# ----------------------------------------------------
+print("==== Sample Data Preview ====")
+df.show(truncate=False)
+
+# ----------------------------------------------------
+# Step 3: Write the clean data as Parquet to consumption S3 prefix
+# ----------------------------------------------------
+df.write.mode("overwrite").parquet(consumption_parquet_path)
+print(f"✅ Parquet written to {consumption_parquet_path}")
+
+# ----------------------------------------------------
+# Step 4: Create Glue-compatible table using the Parquet data
+# ----------------------------------------------------
+spark.sql(f"CREATE DATABASE IF NOT EXISTS {glue_database}")
+
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {glue_database}.{glue_table_name}
+    USING PARQUET
+    LOCATION '{consumption_parquet_path}'
+""")
+print(f"✅ Glue table {glue_database}.{glue_table_name} created.")
+
+# ----------------------------------------------------
+# Step 5: Read back from the Glue table and display
+# ----------------------------------------------------
+print("==== Data from Glue Table ====")
+df2 = spark.sql(f"SELECT * FROM {glue_database}.{glue_table_name}")
+df2.show(truncate=False)
