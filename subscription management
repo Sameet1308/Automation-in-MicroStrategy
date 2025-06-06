@@ -1,0 +1,21 @@
+Use Case: Missing Failure Notifications for Subscriptions
+
+Problem:
+When a MicroStrategy subscription (such as cube or cache refresh, history list, or email/file delivery) fails—especially when triggered by an event or schedule—recipients are not automatically notified of the failure or the reason for it. Only successful deliveries generate notifications.
+
+Ownership/Recipients:
+Each subscription is typically owned by a centralized admin account, but the recipients for each subscription may be different users or groups. The recipients are the actual consumers of the subscription content and may vary across different subscriptions.
+
+Impact:
+
+	•	Recipients are unaware of failed refreshes and may rely on outdated data.
+	•	Failure reasons (job ID, error message) are not visible to recipients.
+
+Example Scenario:
+Suppose a subscription (owned by the admin account) triggers a cube refresh for a specific user group, but the refresh fails due to a data source error. The recipients of this subscription do not receive any notification about the failure or the underlying reason, and are not aware unless they manually check logs or are informed by an administrator.
+
+Request:
+We need a supported solution to:
+
+	•	Automatically notify all recipients (not just the owner) when a subscription fails, including the reason for failure.
+	•	Provide users visibility into both recent successes and failures for their subscriptions.
