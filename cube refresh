@@ -1,0 +1,97 @@
+import requests
+import time
+import urllib3
+
+# ---------------- CONFIGURATION ----------------
+MSTR_BASE_URL = "https://<your-mstr-server>/MicroStrategyLibrary/api"
+USERNAME = "<your-username>"
+PASSWORD = "<your-password>"
+PROJECT_ID = "<your-project-id>"
+CUBE_ID = "<your-cube-id>"
+
+# Disable SSL warnings globally
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --------------- FUNCTIONS --------------------
+
+def mstr_login(base_url, username, password):
+    url = f"{base_url}/auth/login"
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "username": username,
+        "password": password,
+        "loginMode": 1
+    }
+    response = requests.post(url, json=data, headers=headers, verify=False)
+    response.raise_for_status()
+    auth_token = response.headers.get("X-MSTR-AuthToken")
+    cookies = response.cookies
+    return auth_token, cookies
+
+def refresh_cube(base_url, project_id, cube_id, auth_token, cookies):
+    url = f"{base_url}/cubes/{cube_id}/refresh"
+    headers = {
+        "X-MSTR-AuthToken": auth_token,
+        "X-MSTR-ProjectID": project_id,
+        "Accept": "application/json"
+    }
+    response = requests.post(url, headers=headers, cookies=cookies, verify=False)
+    response.raise_for_status()
+    job_id = response.json().get("jobId")
+    if not job_id:
+        raise Exception("No jobId returned! Response: " + str(response.json()))
+    print(f"Triggered cube refresh. Job ID: {job_id}")
+    return job_id
+
+def get_job_status(base_url, project_id, job_id, auth_token, cookies):
+    url = f"{base_url}/projects/{project_id}/jobs/{job_id}"
+    headers = {
+        "X-MSTR-AuthToken": auth_token,
+        "Accept": "application/json"
+    }
+    response = requests.get(url, headers=headers, cookies=cookies, verify=False)
+    response.raise_for_status()
+    return response.json().get("status")
+
+def mstr_logout(base_url, auth_token, cookies):
+    url = f"{base_url}/auth/logout"
+    headers = {"X-MSTR-AuthToken": auth_token}
+    requests.post(url, headers=headers, cookies=cookies, verify=False)
+
+# ---------------- MAIN SCRIPT -----------------
+if __name__ == "__main__":
+    auth_token = None
+    cookies = None
+    try:
+        # Step 1: Login (session active for all calls)
+        auth_token, cookies = mstr_login(MSTR_BASE_URL, USERNAME, PASSWORD)
+        print("Login successful.")
+
+        # Step 2: Trigger cube refresh by cube ID
+        job_id = refresh_cube(MSTR_BASE_URL, PROJECT_ID, CUBE_ID, auth_token, cookies)
+
+        # Step 3: Track cube refresh job status
+        print("Checking cube refresh status...")
+        while True:
+            status = get_job_status(MSTR_BASE_URL, PROJECT_ID, job_id, auth_token, cookies)
+            print(f"Current job status: {status}")
+            if status in ["SUCCESS", "FAILURE", "CANCELED"]:
+                break
+            time.sleep(10)  # Poll every 10 seconds
+
+        if status == "SUCCESS":
+            print("Cube refresh succeeded!")
+        else:
+            print(f"Cube refresh did not succeed. Status: {status}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+    finally:
+        # Step 4: Logout and close session cleanly
+        if auth_token:
+            try:
+                mstr_logout(MSTR_BASE_URL, auth_token, cookies)
+                print("Session closed. Logged out of MicroStrategy.")
+            except Exception:
+                print("Warning: Session may not have closed cleanly.")
