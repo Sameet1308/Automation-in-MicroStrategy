@@ -2,96 +2,103 @@ import requests
 import time
 import urllib3
 
-# ---------------- CONFIGURATION ----------------
-MSTR_BASE_URL = "https://<your-mstr-server>/MicroStrategyLibrary/api"
-USERNAME = "<your-username>"
-PASSWORD = "<your-password>"
-PROJECT_ID = "<your-project-id>"
-CUBE_ID = "<your-cube-id>"
+# ------------- CONFIGURATION -------------
+^[SERVER_BASE = "https://<your-mstr-server>"]({"attribution":{"attributableIndex":"0-1"}})
+^[API_BASE    = f"{SERVER_BASE}/MicroStrategyLibrary/api"]({"attribution":{"attributableIndex":"0-2"}})
+^[API_V2      = f"{API_BASE}/v2"]({"attribution":{"attributableIndex":"0-3"}})
+^[USERNAME    = "<your-username>"]({"attribution":{"attributableIndex":"0-4"}})
+^[PASSWORD    = "<your-password>"]({"attribution":{"attributableIndex":"0-5"}})
+^[PROJECT_ID  = "<your-project-id>"]({"attribution":{"attributableIndex":"0-6"}})
+^[CUBE_ID     = "<your-cube-id>"]({"attribution":{"attributableIndex":"0-7"}})
+^[POLL_DELAY  = 5           # seconds between checks]({"attribution":{"attributableIndex":"0-8"}})
+^[TIMEOUT     = 2 * 3600    # poll up to 2 hours]({"attribution":{"attributableIndex":"0-9"}})
 
-# Disable SSL warnings globally
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+^[urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)]({"attribution":{"attributableIndex":"0-10"}})
 
-# --------------- FUNCTIONS --------------------
+# ------------- FUNCTIONS ---------------
+def login():
+    ^[resp = requests.post(]({"attribution":{"attributableIndex":"0-11"}})
+        ^[f"{API_BASE}/auth/login",]({"attribution":{"attributableIndex":"0-12"}})
+        ^[json={"username": USERNAME, "password": PASSWORD, "loginMode": 1},]({"attribution":{"attributableIndex":"0-13"}})
+        verify=False
+    )
+    resp.raise_for_status()
+    ^[return resp.headers["X-MSTR-AuthToken"], resp.cookies]({"attribution":{"attributableIndex":"0-14"}})
 
-def mstr_login(base_url, username, password):
-    url = f"{base_url}/auth/login"
-    headers = {"Content-Type": "application/json"}
-    data = {
-        "username": username,
-        "password": password,
-        "loginMode": 1
-    }
-    response = requests.post(url, json=data, headers=headers, verify=False)
-    response.raise_for_status()
-    auth_token = response.headers.get("X-MSTR-AuthToken")
-    cookies = response.cookies
-    return auth_token, cookies
+^[def logout(token, cookies):]({"attribution":{"attributableIndex":"0-15"}})
+    requests.post(
+        ^[f"{API_BASE}/auth/logout",]({"attribution":{"attributableIndex":"0-16"}})
+        ^[headers={"X-MSTR-AuthToken": token},]({"attribution":{"attributableIndex":"0-17"}})
+        cookies=cookies,
+        verify=False
+    )
 
-def refresh_cube(base_url, project_id, cube_id, auth_token, cookies):
-    url = f"{base_url}/cubes/{cube_id}/refresh"
-    headers = {
-        "X-MSTR-AuthToken": auth_token,
-        "X-MSTR-ProjectID": project_id,
-        "Accept": "application/json"
-    }
-    response = requests.post(url, headers=headers, cookies=cookies, verify=False)
-    response.raise_for_status()
-    job_id = response.json().get("jobId")
-    if not job_id:
-        raise Exception("No jobId returned! Response: " + str(response.json()))
-    print(f"Triggered cube refresh. Job ID: {job_id}")
-    return job_id
+^[def trigger_cube_refresh(token, cookies):]({"attribution":{"attributableIndex":"0-18"}})
+    ^[resp = requests.post(]({"attribution":{"attributableIndex":"0-19"}})
+        ^[f"{API_V2}/cubes/{CUBE_ID}",]({"attribution":{"attributableIndex":"0-20"}})
+        headers={
+            ^["X-MSTR-AuthToken": token,]({"attribution":{"attributableIndex":"0-21"}})
+            ^["X-MSTR-ProjectID": PROJECT_ID,]({"attribution":{"attributableIndex":"0-22"}})
+        },
+        cookies=cookies,
+        verify=False
+    )
+    resp.raise_for_status()
+    ^[print("✅ Cube refresh triggered (accepted).")]({"attribution":{"attributableIndex":"0-23"}})
 
-def get_job_status(base_url, project_id, job_id, auth_token, cookies):
-    url = f"{base_url}/projects/{project_id}/jobs/{job_id}"
-    headers = {
-        "X-MSTR-AuthToken": auth_token,
-        "Accept": "application/json"
-    }
-    response = requests.get(url, headers=headers, cookies=cookies, verify=False)
-    response.raise_for_status()
-    return response.json().get("status")
+^[def get_cube_status(token, cookies):]({"attribution":{"attributableIndex":"0-24"}})
+    ^[resp = requests.head(]({"attribution":{"attributableIndex":"0-25"}})
+        ^[f"{API_BASE}/cubes/{CUBE_ID}",]({"attribution":{"attributableIndex":"0-26"}})
+        headers={
+            ^["X-MSTR-AuthToken": token,]({"attribution":{"attributableIndex":"0-27"}})
+            ^["X-MSTR-ProjectID": PROJECT_ID,]({"attribution":{"attributableIndex":"0-28"}})
+        },
+        cookies=cookies,
+        verify=False
+    )
+    resp.raise_for_status()
+    ^[return resp.headers.get("X-MSTR-CubeStatus")]({"attribution":{"attributableIndex":"0-29"}})
 
-def mstr_logout(base_url, auth_token, cookies):
-    url = f"{base_url}/auth/logout"
-    headers = {"X-MSTR-AuthToken": auth_token}
-    requests.post(url, headers=headers, cookies=cookies, verify=False)
+# -------------- MAIN LOGIC -------------
+^[if __name__ == "__main__":]({"attribution":{"attributableIndex":"0-30"}})
+    ^[token = cookies = None]({"attribution":{"attributableIndex":"0-31"}})
+    ^[start_time = time.time()]({"attribution":{"attributableIndex":"0-32"}})
 
-# ---------------- MAIN SCRIPT -----------------
-if __name__ == "__main__":
-    auth_token = None
-    cookies = None
     try:
-        # Step 1: Login (session active for all calls)
-        auth_token, cookies = mstr_login(MSTR_BASE_URL, USERNAME, PASSWORD)
-        print("Login successful.")
+        token, cookies = login()
+        print("🔓 Successfully logged in.")
 
-        # Step 2: Trigger cube refresh by cube ID
-        job_id = refresh_cube(MSTR_BASE_URL, PROJECT_ID, CUBE_ID, auth_token, cookies)
+        trigger_cube_refresh(token, cookies)
 
-        # Step 3: Track cube refresh job status
-        print("Checking cube refresh status...")
+        print(f"⏳ Polling cube status for up to {TIMEOUT/3600:.1f} hours...")
         while True:
-            status = get_job_status(MSTR_BASE_URL, PROJECT_ID, job_id, auth_token, cookies)
-            print(f"Current job status: {status}")
-            if status in ["SUCCESS", "FAILURE", "CANCELED"]:
-                break
-            time.sleep(10)  # Poll every 10 seconds
+            elapsed = time.time() - start_time
+            status_header = get_cube_status(token, cookies)
+            print(f"[{elapsed:.0f}s] Cube status: {status_header}")
 
-        if status == "SUCCESS":
-            print("Cube refresh succeeded!")
-        else:
-            print(f"Cube refresh did not succeed. Status: {status}")
+            if not status_header:
+                raise RuntimeError("No status header returned from HEAD request.")
+
+            st = status_header.lower()
+            if st in ("processed", "loaded", "available"):
+                print("🎉 Cube refresh succeeded.")
+                break
+
+            if any(err in st for err in ("error", "dirty", "infodirty", "failed")):
+                raise RuntimeError(f"❌ Cube refresh failed with status: {status_header}")
+
+            if elapsed > TIMEOUT:
+                raise TimeoutError("⏱ Timeout reached (2 hours) waiting for cube refresh.")
+
+            time.sleep(POLL_DELAY)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print("⚠️ Error occurred:", e)
 
     finally:
-        # Step 4: Logout and close session cleanly
-        if auth_token:
+        if token:
             try:
-                mstr_logout(MSTR_BASE_URL, auth_token, cookies)
-                print("Session closed. Logged out of MicroStrategy.")
-            except Exception:
-                print("Warning: Session may not have closed cleanly.")
+                logout(token, cookies)
+                print("🔐 Logged out and session ended.")
+            except:
+                print("⚠️ Logout may have failed.")
