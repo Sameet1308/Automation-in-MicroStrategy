@@ -1,104 +1,89 @@
-import requests
 import time
-import urllib3
+from mstrio.connection import Connection
+from mstrio.api.cubes import cubes
+from mstrio.project_objects.datasets.cube_cache import list_cube_caches, CubeCache
 
-# ------------- CONFIGURATION -------------
-^[SERVER_BASE = "https://<your-mstr-server>"]({"attribution":{"attributableIndex":"0-1"}})
-^[API_BASE    = f"{SERVER_BASE}/MicroStrategyLibrary/api"]({"attribution":{"attributableIndex":"0-2"}})
-^[API_V2      = f"{API_BASE}/v2"]({"attribution":{"attributableIndex":"0-3"}})
-^[USERNAME    = "<your-username>"]({"attribution":{"attributableIndex":"0-4"}})
-^[PASSWORD    = "<your-password>"]({"attribution":{"attributableIndex":"0-5"}})
-^[PROJECT_ID  = "<your-project-id>"]({"attribution":{"attributableIndex":"0-6"}})
-^[CUBE_ID     = "<your-cube-id>"]({"attribution":{"attributableIndex":"0-7"}})
-^[POLL_DELAY  = 5           # seconds between checks]({"attribution":{"attributableIndex":"0-8"}})
-^[TIMEOUT     = 2 * 3600    # poll up to 2 hours]({"attribution":{"attributableIndex":"0-9"}})
+# ─── CONFIG ────────────────────────────────────────────
+BASE_URL = "https://your-mstr-server/MicroStrategyLibrary/api"
+USERNAME = "your_user"
+PASSWORD = "your_password"
+PROJECT = "YourProject"
+CUBE_ID = "your_cube_id"
+POLL_DELAY = 5      # seconds
+TIMEOUT = 3600      # seconds (1 hour)
+# ───────────────────────────────────────────────────────
 
-^[urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)]({"attribution":{"attributableIndex":"0-10"}})
+def get_cache_id(conn):
+    caches = list_cube_caches(connection=conn, cube_id=CUBE_ID)
+    if not caches:
+        raise ValueError(f"No cube cache found for cube ID {CUBE_ID}")
+    cache = caches[0]
+    print(f"📦 Using cache ID {cache.id} (state={cache.state['loadedState']})")
+    return cache.id
 
-# ------------- FUNCTIONS ---------------
-def login():
-    ^[resp = requests.post(]({"attribution":{"attributableIndex":"0-11"}})
-        ^[f"{API_BASE}/auth/login",]({"attribution":{"attributableIndex":"0-12"}})
-        ^[json={"username": USERNAME, "password": PASSWORD, "loginMode": 1},]({"attribution":{"attributableIndex":"0-13"}})
-        verify=False
-    )
-    resp.raise_for_status()
-    ^[return resp.headers["X-MSTR-AuthToken"], resp.cookies]({"attribution":{"attributableIndex":"0-14"}})
+def wait_for_refresh(conn):
+    start_ts = time.time()
+    refresh_started = False
 
-^[def logout(token, cookies):]({"attribution":{"attributableIndex":"0-15"}})
-    requests.post(
-        ^[f"{API_BASE}/auth/logout",]({"attribution":{"attributableIndex":"0-16"}})
-        ^[headers={"X-MSTR-AuthToken": token},]({"attribution":{"attributableIndex":"0-17"}})
-        cookies=cookies,
-        verify=False
-    )
+    while True:
+        elapsed = int(time.time() - start_ts)
+        if elapsed > TIMEOUT:
+            raise TimeoutError(f"Timeout after {elapsed}s: refresh did not complete.")
 
-^[def trigger_cube_refresh(token, cookies):]({"attribution":{"attributableIndex":"0-18"}})
-    ^[resp = requests.post(]({"attribution":{"attributableIndex":"0-19"}})
-        ^[f"{API_V2}/cubes/{CUBE_ID}",]({"attribution":{"attributableIndex":"0-20"}})
-        headers={
-            ^["X-MSTR-AuthToken": token,]({"attribution":{"attributableIndex":"0-21"}})
-            ^["X-MSTR-ProjectID": PROJECT_ID,]({"attribution":{"attributableIndex":"0-22"}})
-        },
-        cookies=cookies,
-        verify=False
-    )
-    resp.raise_for_status()
-    ^[print("✅ Cube refresh triggered (accepted).")]({"attribution":{"attributableIndex":"0-23"}})
+        resp = cubes.status(conn, cube_id=CUBE_ID, throw_error=True)
+        code = int(resp.headers["X-MSTR-CubeStatus"])
+        states = conn.show_status(code)  # e.g. ["LOADED", "ACTIVE", "LOAD_PENDING"]  [oai_citation:0‡www2.microstrategy.com](https://www2.microstrategy.com/producthelp/current/mstrio-py/mstrio.project_objects.datasets.html?utm_source=chatgpt.com) [oai_citation:1‡www2.microstrategy.com](https://www2.microstrategy.com/producthelp/Current/mstrio-py/sections/toc5.html?utm_source=chatgpt.com) [oai_citation:2‡github.com](https://github.com/MicroStrategy/mstrio-py/blob/master/code_snippets/cube_cache.py?utm_source=chatgpt.com)
 
-^[def get_cube_status(token, cookies):]({"attribution":{"attributableIndex":"0-24"}})
-    ^[resp = requests.head(]({"attribution":{"attributableIndex":"0-25"}})
-        ^[f"{API_BASE}/cubes/{CUBE_ID}",]({"attribution":{"attributableIndex":"0-26"}})
-        headers={
-            ^["X-MSTR-AuthToken": token,]({"attribution":{"attributableIndex":"0-27"}})
-            ^["X-MSTR-ProjectID": PROJECT_ID,]({"attribution":{"attributableIndex":"0-28"}})
-        },
-        cookies=cookies,
-        verify=False
-    )
-    resp.raise_for_status()
-    ^[return resp.headers.get("X-MSTR-CubeStatus")]({"attribution":{"attributableIndex":"0-29"}})
+        if "LOAD_PENDING" in states:
+            if not refresh_started:
+                print(f"[{elapsed}s] 🚀 Refresh execution started.")
+            refresh_started = True
 
-# -------------- MAIN LOGIC -------------
-^[if __name__ == "__main__":]({"attribution":{"attributableIndex":"0-30"}})
-    ^[token = cookies = None]({"attribution":{"attributableIndex":"0-31"}})
-    ^[start_time = time.time()]({"attribution":{"attributableIndex":"0-32"}})
+        elif "LOADED" in states and "ACTIVE" in states:
+            if refresh_started:
+                print(f"[{elapsed}s] ✅ Refresh completed (states={states}).")
+                return
+            else:
+                print(f"[{elapsed}s] ⏳ Refresh queued (still idle).")
 
+        else:
+            print(f"[{elapsed}s] ❗ Unexpected cube states: {states}")
+            raise RuntimeError(f"Unexpected cube status flags: {states}")
+
+        time.sleep(POLL_DELAY)
+
+def confirm_with_cache(conn, cache_id):
+    cache = CubeCache(connection=conn, id=cache_id)
+    cache.fetch()
+    ls = cache.state.get("loadedState")
+    proc = cache.state.get("processing")
+    print(f"🔍 Cache monitor: loadedState={ls}, processing={proc}")
+    if ls == "loaded" and not proc:
+        print("🎉 Cube cache successfully loaded and idle.")
+    else:
+        print("⚠️ Cache not yet idle after refresh; state:", ls, proc)
+
+def main():
     try:
-        token, cookies = login()
-        print("🔓 Successfully logged in.")
+        conn = Connection(BASE_URL, USERNAME, PASSWORD, project_name=PROJECT)
+        print("✅ Connected to MicroStrategy.")
 
-        trigger_cube_refresh(token, cookies)
+        cache_id = get_cache_id(conn)
 
-        print(f"⏳ Polling cube status for up to {TIMEOUT/3600:.1f} hours...")
-        while True:
-            elapsed = time.time() - start_time
-            status_header = get_cube_status(token, cookies)
-            print(f"[{elapsed:.0f}s] Cube status: {status_header}")
+        cubes.publish(conn, CUBE_ID)
+        print("📤 Cube refresh triggered.")
 
-            if not status_header:
-                raise RuntimeError("No status header returned from HEAD request.")
-
-            st = status_header.lower()
-            if st in ("processed", "loaded", "available"):
-                print("🎉 Cube refresh succeeded.")
-                break
-
-            if any(err in st for err in ("error", "dirty", "infodirty", "failed")):
-                raise RuntimeError(f"❌ Cube refresh failed with status: {status_header}")
-
-            if elapsed > TIMEOUT:
-                raise TimeoutError("⏱ Timeout reached (2 hours) waiting for cube refresh.")
-
-            time.sleep(POLL_DELAY)
+        wait_for_refresh(conn)
+        confirm_with_cache(conn, cache_id)
 
     except Exception as e:
-        print("⚠️ Error occurred:", e)
-
+        print("❌ ERROR:", e)
     finally:
-        if token:
-            try:
-                logout(token, cookies)
-                print("🔐 Logged out and session ended.")
-            except:
-                print("⚠️ Logout may have failed.")
+        try:
+            conn.close()
+            print("🔒 Logged out.")
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
