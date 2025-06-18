@@ -1,0 +1,105 @@
+import requests
+import urllib3
+import pandas as pd
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# --- Config ---
+BASE_URL = "https://your-microstrategy-env/MicroStrategyLibrary/api"
+USERNAME = "your-username"
+PASSWORD = "your-password"
+
+def login():
+    resp = requests.post(
+        f"{BASE_URL}/auth/login",
+        json={"username": USERNAME, "password": PASSWORD, "loginMode": 1},
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.headers["X-MSTR-AuthToken"]
+
+def logout(token):
+    requests.post(f"{BASE_URL}/auth/logout", headers={"X-MSTR-AuthToken": token}, verify=False)
+
+def get_projects(token):
+    resp = requests.get(
+        f"{BASE_URL}/projects",
+        params={"limit": -1},
+        headers={"X-MSTR-AuthToken": token},
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.json()["data"]
+
+def get_datasources(token, proj_id):
+    resp = requests.get(
+        f"{BASE_URL}/datasources",
+        params={"projectId": proj_id},
+        headers={"X-MSTR-AuthToken": token},
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+def get_dependents(token, proj_id, ds_id, offset=0, limit=100):
+    resp = requests.post(
+        f"{BASE_URL}/metadataSearch/results",
+        params={"offset": offset, "limit": limit, "domain": 2},
+        headers={"X-MSTR-AuthToken": token, "X-MSTR-ProjectID": proj_id},
+        json={"usesObject": {"objectId": ds_id, "objectType": 32}, "usesRecursive": True},
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+def get_folder_path(token, proj_id, obj_id):
+    resp = requests.get(
+        f"{BASE_URL}/objects/{obj_id}?showAncestor=true",
+        headers={"X-MSTR-AuthToken": token, "X-MSTR-ProjectID": proj_id},
+        verify=False
+    )
+    resp.raise_for_status()
+    return "\\".join(a["name"] for a in resp.json().get("ancestors", []))
+
+def main():
+    token = login()
+    print("🔐 REST Connected (SSL verify=False)")
+    rows = []
+
+    try:
+        for proj in get_projects(token):
+            pid, pname = proj["id"], proj["name"]
+            datasources = get_datasources(token, pid)
+
+            for ds in datasources:
+                dsid, dsname = ds["id"], ds["name"]
+                offset = 0
+
+                while True:
+                    deps = get_dependents(token, pid, dsid, offset=offset)
+                    if not deps:
+                        break
+                    for d in deps:
+                        folder = get_folder_path(token, pid, d["id"])
+                        rows.append({
+                            "project_name": pname,
+                            "datasource_name": dsname,
+                            "dependent_name": d["name"],
+                            "dependent_id": d["id"],
+                            "dependent_type": d["type"],
+                            "folder_path": folder
+                        })
+                    offset += len(deps)
+    finally:
+        logout(token)
+        print("🔒 REST Logged out")
+
+    df = pd.DataFrame(rows)
+    print(df.head())
+    # df.to_csv("mstr_dependencies_rest.csv", index=False)
+
+if __name__ == "__main__":
+    main()
