@@ -1,0 +1,75 @@
+import pandas as pd
+import urllib3
+from mstrio.connection import Connection
+from mstrio.server.environment import Environment
+from mstrio.object_management.search_operations import full_search
+from mstrio.types import ObjectTypes, SearchDomain
+
+# Suppress SSL warnings and ignore verification
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- Config ---
+BASE_URL = "https://your-microstrategy-env/MicroStrategyLibrary/api"
+USERNAME = "your-username"
+PASSWORD = "your-password"
+
+def main():
+    conn = Connection(
+        base_url=BASE_URL,
+        username=USERNAME,
+        password=PASSWORD,
+        login_mode=1,
+        ssl_verify=False
+    )
+    print("🔐 SDK Connected (SSL verify=False)")
+
+    env = Environment(conn)
+    projects = env.list_projects(to_dictionary=True)
+
+    rows = []
+    for proj in projects:
+        proj_id, proj_name = proj["id"], proj["name"]
+        datasources = conn.datasources.list_datasource_instances(
+            project=proj_id, to_dictionary=True
+        )
+
+        for ds in datasources:
+            ds_id, ds_name = ds["id"], ds["name"]
+            offset, limit = 0, 100
+
+            while True:
+                deps = full_search(
+                    connection=conn,
+                    project=proj_id,
+                    uses_object_id=ds_id,
+                    uses_object_type=ObjectTypes.Datasource,
+                    uses_recursive=True,
+                    domain=SearchDomain.PROJECT,
+                    limit=limit,
+                    offset=offset,
+                    to_dictionary=True
+                )
+                if not deps:
+                    break
+
+                for d in deps:
+                    folder = "/" + "/".join(a["name"] for a in d.get("ancestors", []))
+                    rows.append({
+                        "project_name": proj_name,
+                        "datasource_name": ds_name,
+                        "dependent_name": d["name"],
+                        "dependent_id": d["id"],
+                        "dependent_type": d["type"],
+                        "folder_path": folder
+                    })
+                offset += len(deps)
+
+    conn.close()
+    print("🔒 SDK Logged out")
+
+    df = pd.DataFrame(rows)
+    print(df.head())
+    # df.to_csv("mstr_dependencies_sdk.csv", index=False)
+
+if __name__ == "__main__":
+    main()
