@@ -1,0 +1,50 @@
+# using requests, Python 3.9+
+
+import requests
+import urllib3
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Suppress insecure SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+BASE_URL = "https://<mstr-server>/MicroStrategyLibrary/api"
+
+def get_dependents(auth_token: str, project_id: str, datasource_id: str, recursive: bool = True) -> list[dict]:
+    """
+    Retrieves direct or recursive dependents of a given database instance (datasource)
+    in a MicroStrategy project.
+
+    Args:
+        auth_token: X-MSTR-AuthToken string from login
+        project_id: target MicroStrategy project ID
+        datasource_id: ID of the datasource object (objectType=32)
+        recursive: True to include indirect dependents (usesRecursive), else False
+
+    Returns:
+        List of dependent object dicts with keys like 'id', 'name', 'type', 'ancestors'
+    """
+    # 1. Initiate metadata search
+    url = f"{BASE_URL}/metadataSearches/results"
+    headers = {
+        "X-MSTR-AuthToken": auth_token,
+        "X-MSTR-ProjectID": project_id,
+        "Accept": "application/json"
+    }
+    params = {
+        "domain": 2,
+        "usesObject": f"{datasource_id};32",
+        "usesRecursive": str(recursive).lower()
+    }
+
+    resp = requests.post(url, headers=headers, params=params, verify=False)
+    resp.raise_for_status()
+    search_id = resp.json().get("searchId")
+    if not search_id:
+        return []
+
+    # 2. Retrieve results
+    get_url = f"{url}/{search_id}"
+    resp = requests.get(get_url, headers=headers, verify=False)
+    resp.raise_for_status()
+    return resp.json().get("result", [])
