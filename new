@@ -1,50 +1,43 @@
-# using requests, Python 3.9+
+Dear Team,
 
-import requests
-import urllib3
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
+As a follow-up to our recent meeting with the Cloud Admin and Governance teams, please find below the summary of the finalized strategy for structuring MicroStrategy reporting using Unity Catalog in Databricks.
 
-# Suppress insecure SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+⸻
 
-BASE_URL = "https://<mstr-server>/MicroStrategyLibrary/api"
+✅ Key Agreements and Actionable Points
+	1.	Introduction of Reporting Analytics as a New Data Zone
+	•	Alongside existing data zones (raw, curated, refined, etc.), a new Reporting Analytics data zone is being introduced.
+	•	This zone is purpose-built to support MicroStrategy reporting needs across the enterprise in a governed and centralized manner.
+	2.	Single Unity Catalog per Environment
+	•	A single Unity Catalog will be created for this data zone per environment (dev, disc, prod), e.g., uc_bi_reporting_analytics_dev.
+	•	This approach avoids catalog sprawl and improves scalability.
+	3.	Schemas Represent Capabilities/Applications
+	•	Within this Unity Catalog, individual schemas will represent capabilities or MicroStrategy applications.
+	•	Schema creation will be owned and managed by the Platform Governance team based on formal requests from app teams.
+	4.	App Teams Own Table Development
+	•	Once schema access is granted, respective app teams will independently create and manage tables for their reporting needs.
+	5.	Service Principal & SQL Warehouse Strategy
+	•	A dedicated service principal ID per environment will be provided for reporting access to this Unity Catalog.
+	•	A single SQL Warehouse per environment will be managed by the Platform Governance team for all reporting analytics consumption via MicroStrategy.
+	•	For any other Unity Catalogs or zones outside this scope, app teams must manage their own SPs and compute resources.
+	6.	Governance Boundary
+	•	Full ownership of this reporting analytics catalog — including schema management and access provisioning — rests with the Platform Governance team.
+	•	No external team is permitted to create catalogs or schemas directly within this space.
 
-def get_dependents(auth_token: str, project_id: str, datasource_id: str, recursive: bool = True) -> list[dict]:
-    """
-    Retrieves direct or recursive dependents of a given database instance (datasource)
-    in a MicroStrategy project.
+⸻
 
-    Args:
-        auth_token: X-MSTR-AuthToken string from login
-        project_id: target MicroStrategy project ID
-        datasource_id: ID of the datasource object (objectType=32)
-        recursive: True to include indirect dependents (usesRecursive), else False
+🧭 Architectural Consideration and Adjustment
 
-    Returns:
-        List of dependent object dicts with keys like 'id', 'name', 'type', 'ancestors'
-    """
-    # 1. Initiate metadata search
-    url = f"{BASE_URL}/metadataSearches/results"
-    headers = {
-        "X-MSTR-AuthToken": auth_token,
-        "X-MSTR-ProjectID": project_id,
-        "Accept": "application/json"
-    }
-    params = {
-        "domain": 2,
-        "usesObject": f"{datasource_id};32",
-        "usesRecursive": str(recursive).lower()
-    }
+As per the initial architectural recommendation, the plan was to create one Unity Catalog per capability. However, in practice, capabilities mapped to MicroStrategy are more aligned with microservice-level applications, not true enterprise capabilities.
 
-    resp = requests.post(url, headers=headers, params=params, verify=False)
-    resp.raise_for_status()
-    search_id = resp.json().get("searchId")
-    if not search_id:
-        return []
+Given the presence of over 500 applications across 27 projects, this would lead to an unmanageable number of Unity Catalogs and governance overhead.
 
-    # 2. Retrieve results
-    get_url = f"{url}/{search_id}"
-    resp = requests.get(get_url, headers=headers, verify=False)
-    resp.raise_for_status()
-    return resp.json().get("result", [])
+After evaluating this with the Cloud Admin team, we are aligning on a single-catalog-per-zone model for reporting analytics — which remains scalable, governable, and consistent with enterprise policy.
+
+We are highlighting this revised implementation here to ensure alignment with Architecture and would welcome any final observations. If there are no objections, we will proceed in this direction.
+
+⸻
+
+We request your official sign-off on the above points so we may move forward with implementation.
+
+Looking forward to your confirmation.
