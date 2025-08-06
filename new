@@ -1,43 +1,23 @@
-Dear Team,
+Hi Team,
 
-As a follow-up to our recent meeting with the Cloud Admin and Governance teams, please find below the summary of the finalized strategy for structuring MicroStrategy reporting using Unity Catalog in Databricks.
+Just wanted to clarify the purpose behind the dashboard cache update subscriptions I had set up.
 
-⸻
+These subscriptions are strictly at the dashboard level — they don’t touch the underlying datasets, cubes, or reports. Their job is to pre-generate the dashboard’s visual layout and page-level cache to help improve the load time and navigation experience for users, especially during peak hours.
 
-✅ Key Agreements and Actionable Points
-	1.	Introduction of Reporting Analytics as a New Data Zone
-	•	Alongside existing data zones (raw, curated, refined, etc.), a new Reporting Analytics data zone is being introduced.
-	•	This zone is purpose-built to support MicroStrategy reporting needs across the enterprise in a governed and centralized manner.
-	2.	Single Unity Catalog per Environment
-	•	A single Unity Catalog will be created for this data zone per environment (dev, disc, prod), e.g., uc_bi_reporting_analytics_dev.
-	•	This approach avoids catalog sprawl and improves scalability.
-	3.	Schemas Represent Capabilities/Applications
-	•	Within this Unity Catalog, individual schemas will represent capabilities or MicroStrategy applications.
-	•	Schema creation will be owned and managed by the Platform Governance team based on formal requests from app teams.
-	4.	App Teams Own Table Development
-	•	Once schema access is granted, respective app teams will independently create and manage tables for their reporting needs.
-	5.	Service Principal & SQL Warehouse Strategy
-	•	A dedicated service principal ID per environment will be provided for reporting access to this Unity Catalog.
-	•	A single SQL Warehouse per environment will be managed by the Platform Governance team for all reporting analytics consumption via MicroStrategy.
-	•	For any other Unity Catalogs or zones outside this scope, app teams must manage their own SPs and compute resources.
-	6.	Governance Boundary
-	•	Full ownership of this reporting analytics catalog — including schema management and access provisioning — rests with the Platform Governance team.
-	•	No external team is permitted to create catalogs or schemas directly within this space.
+That said, I understand there’s a concern about whether these subscriptions could be causing slowness on the front end. From what I’ve reviewed in the MicroStrategy documentation, these cache updates are designed to run in the background. But yes, if a user happens to open the dashboard exactly when the cache is being updated, it’s possible they might temporarily miss the cache and the server ends up re-rendering things live — which can feel slow.
 
-⸻
+However, just to highlight — this slowness has always been there, even before we introduced these subscriptions. In fact, we added them with the intention to reduce the load time and improve user experience, not worsen it.
 
-🧭 Architectural Consideration and Adjustment
+That said, it may be worth taking a quick look at the server-side activity during the reported time windows. Since this MicroStrategy server is shared across multiple projects, there could be other jobs or subscriptions running in parallel. A few things that might help us identify any bottlenecks:
+	•	Overall CPU and memory usage on the Intelligence Server
+	•	Number of concurrent jobs or dashboard executions at that time
+	•	Any queue build-up or delayed job execution
+	•	Whether the cache working set limits are being hit (leading to eviction of active page caches)
+	•	Any signs of thread contention or long-running processes
 
-As per the initial architectural recommendation, the plan was to create one Unity Catalog per capability. However, in practice, capabilities mapped to MicroStrategy are more aligned with microservice-level applications, not true enterprise capabilities.
+Even just getting a general view of server load during that window could help us narrow it down.
 
-Given the presence of over 500 applications across 27 projects, this would lead to an unmanageable number of Unity Catalogs and governance overhead.
+Happy to work with you on timing adjustments or a test window if needed. Appreciate the help!
 
-After evaluating this with the Cloud Admin team, we are aligning on a single-catalog-per-zone model for reporting analytics — which remains scalable, governable, and consistent with enterprise policy.
-
-We are highlighting this revised implementation here to ensure alignment with Architecture and would welcome any final observations. If there are no objections, we will proceed in this direction.
-
-⸻
-
-We request your official sign-off on the above points so we may move forward with implementation.
-
-Looking forward to your confirmation.
+Thanks,
+Sameet
