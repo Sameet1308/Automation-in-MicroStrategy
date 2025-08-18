@@ -1,32 +1,284 @@
-Sure, here's the content you can use to create a Confluence page about extracting data lineage from MicroStrategy cubes:
-Extracting Data Lineage from MicroStrategy Cubes
-This page explains how to extract data lineage from MicroStrategy cubes to understand their dependencies on underlying database tables and columns. This information can be used to improve data management, enhance data quality, and streamline data governance.
-Benefits
- * Identify redundant cubes and datasets based on shared tables and columns.
- * Consolidate cubes with identical functionalities.
- * Analyze extracted SQL to design optimal data models.
- * Prioritize tables for cloud migration or SQL optimization based on cube dependencies.
- * Facilitate data migration and future technology stack changes with clear data lineage.
- * Maintain data transparency for regulatory compliance.
-Who Benefits
- * Data Analysts: Understand data dependencies for impact analysis on cubes and underlying tables.
- * Data Architects: Identify opportunities for data model optimization based on data lineage.
- * Data Engineers: Prioritize tables for cloud migration or SQL optimization based on cube usage.
- * IT Teams: Ensure data integrity during system migrations by understanding cube dependencies.
-Process Overview
- * Connect to MicroStrategy API (Python): Use Python libraries like mstrio to connect to the MicroStrategy environment using its REST API.
- * Enumerate Cubes in Project: Enumerate all the cubes within the chosen MicroStrategy project.
- * Extract SQL for Each Cube: Extract the corresponding SQL query that defines each cube's data source and transformations.
- * Parse SQL for Tables and Columns: Employ techniques like regular expressions or SQL parsing libraries to identify the tables and columns referenced within the extracted SQL queries.
- * Map Tables and Columns to Cubes: Establish relationships between the cubes, the tables and columns they utilize, forming a comprehensive data lineage map.
-Future Action Items
- * Refine SQL parsing to handle complex queries for accurate data lineage extraction of tables and columns.
- * Integrate with data dictionary validation to ensure extracted table and column names are accurate.
- * Implement a feedback loop for users to report parsing errors or inaccuracies for continuous improvement.
-Tools and Technologies
- * Python
- * mstrio library (or equivalent)
- * SQL parsing libraries (regular expressions, ANTLR, etc.)
-Next Steps
- * Refer to the "Data Lineage Extraction Workflow" section for a detailed breakdown of the process.
- * Explore the provided resources (if any) to delve deeper into specific aspects of data lineage extraction from MicroStrategy cubes.
+# ======================================================================================
+#  Databricks | Raw Parquet (S3)  ➜  Delta (S3 consumption)  ➜  Unity Catalog Table
+#  Single-file, end-to-end script with clear sectioning & comments
+# ======================================================================================
+#  What this does:
+#   1) Reads Parquet files from a RAW S3 prefix
+#   2) (Optional) Applies transformations
+#   3) Writes output as Delta to a CONSUMPTION S3 prefix
+#   4) Registers/updates a Unity Catalog external table on that Delta path
+#   5) (Optional) Auto Loader for ongoing ingestion from a landing path
+#
+#  Run mode:
+#   - Databricks Notebook (single cell) OR Databricks Job (Python task)
+#   - Requires: UC-enabled cluster/warehouse + External Location/Storage Credential
+#
+#  Notes:
+#   - You do NOT need to list columns when registering the UC table over a Delta folder.
+#   - For first-time UC wiring, ensure:
+#       CREATE STORAGE CREDENTIAL ...; CREATE EXTERNAL LOCATION ...; GRANTs...
+# ======================================================================================
+
+# -----------------------------
+# SECTION 0: Imports & Spark
+# -----------------------------
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+import sys
+import traceback
+from typing import List
+
+spark = SparkSession.builder.getOrCreate()
+
+# -----------------------------
+# SECTION 1: PARAMETERS (EDIT THESE)
+# -----------------------------
+# --- Unity Catalog placement ---
+CATALOG       = "my_catalog"          # e.g., "main"
+SCHEMA        = "my_schema"           # e.g., "consumption"
+TABLE_NAME    = "sales_txn"           # e.g., "sales_txn"
+
+# --- S3 paths (RAW input ➜ CONSUMPTION output) ---
+RAW_PARQUET_PATH  = "s3://my-bucket/raw/mytbl/"       # folder with source Parquet files
+CONS_DELTA_PATH   = "s3://my-bucket/cons/mytbl/"      # folder to hold Delta table (has _delta_log/)
+
+# --- Write/maintenance options ---
+WRITE_MODE           = "overwrite"   # "append" or "overwrite"
+PARTITION_COLS       = ["event_date"]  # [] for no partitioning; ensure the column exists if used
+OVERWRITE_SCHEMA     = True
+RUN_OPTIMIZE         = True
+ZORDER_COLS          = ["event_date", "id"]  # [] to skip Z-ORDER
+RUN_VACUUM           = False
+VACUUM_RETAIN_HOURS  = 168  # 7 days; increase if readers need longer time travel
+
+# --- Streaming / Auto Loader (optional continuous ingestion) ---
+ENABLE_AUTO_LOADER      = False             # set True to enable streaming ingestion
+LANDING_PATH            = "s3://my-bucket/raw/mytbl_landing/"  # new-arrivals folder
+CHECKPOINT_DIR          = "s3://my-bucket/checkpoints/sales_txn_ingest"
+STREAM_CONTINUOUS       = False             # False => trigger(availableNow=True) batch-like
+STREAM_MERGE_SCHEMA     = True
+
+# --- Misc safety knobs ---
+PRINT_SAMPLE_ROWS       = 5
+SHOW_EXTENDED_DESC      = True
+
+# -----------------------------
+# SECTION 2: Helper utilities
+# -----------------------------
+def info(msg: str):
+    print(f"[INFO] {msg}")
+
+def warn(msg: str):
+    print(f"[WARN] {msg}")
+
+def err(msg: str):
+    print(f"[ERROR] {msg}", file=sys.stderr)
+
+def assert_non_empty_path(path: str, label: str):
+    if not path or not path.strip():
+        raise ValueError(f"{label} must be a non-empty S3 URI (e.g., s3://bucket/prefix/).")
+
+def ensure_uc_context(catalog: str, schema: str):
+    """
+    Ensures the target catalog/schema exist.
+    In Unity Catalog, CREATE SCHEMA IF NOT EXISTS is sufficient with proper grants.
+    """
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
+    spark.sql(f"CREATE SCHEMA  IF NOT EXISTS {catalog}.{schema}")
+    info(f"Ensured UC context: {catalog}.{schema}")
+
+def describe_table(catalog: str, schema: str, table: str):
+    if SHOW_EXTENDED_DESC:
+        spark.sql(f"DESCRIBE EXTENDED {catalog}.{schema}.{table}").show(truncate=False)
+
+def apply_business_transformations(df: DataFrame) -> DataFrame:
+    """
+    Place your business logic here. Keep it idempotent and schema-aware.
+    Examples below are commented; adapt as needed.
+    """
+    # Example: add an ingestion timestamp
+    df = df.withColumn("ingest_ts", F.current_timestamp())
+
+    # Example: derive a date column if partitioning by it
+    # If your raw has 'event_ts', you can derive 'event_date'
+    if "event_ts" in df.columns and "event_date" not in df.columns:
+        df = df.withColumn("event_date", F.to_date("event_ts"))
+    return df
+
+def write_delta(
+    df: DataFrame,
+    delta_path: str,
+    mode: str = "overwrite",
+    partition_cols: List[str] = None,
+    overwrite_schema: bool = True
+):
+    """
+    Writes the DataFrame as Delta to the specified path.
+    """
+    writer = df.write.format("delta").mode(mode)
+    if overwrite_schema:
+        writer = writer.option("overwriteSchema", "true")
+    if partition_cols:
+        # Validate partition columns exist to avoid silent failures
+        missing = [c for c in partition_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Partition columns missing in DataFrame: {missing}")
+        writer = writer.partitionBy(*partition_cols)
+    writer.save(delta_path)
+    info(f"Wrote Delta data to: {delta_path} (mode={mode}, partitions={partition_cols or 'None'})")
+
+def register_uc_table(catalog: str, schema: str, table: str, delta_path: str):
+    """
+    Registers (or reuses) a UC table pointing to the given Delta folder.
+    No need to list columns; UC reads schema from the Delta log.
+    """
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {catalog}.{schema}.{table}
+        USING DELTA
+        LOCATION '{delta_path}'
+    """)
+    info(f"Registered/verified UC table: {catalog}.{schema}.{table}")
+
+def optimize_and_zorder(catalog: str, schema: str, table: str, zcols: List[str]):
+    """
+    Runs OPTIMIZE; optionally Z-ORDERs by provided columns.
+    """
+    if zcols:
+        spark.sql(f"OPTIMIZE {catalog}.{schema}.{table} ZORDER BY ({', '.join(zcols)})")
+        info(f"OPTIMIZE + Z-ORDER applied on {catalog}.{schema}.{table} by {zcols}")
+    else:
+        spark.sql(f"OPTIMIZE {catalog}.{schema}.{table}")
+        info(f"OPTIMIZE applied on {catalog}.{schema}.{table}")
+
+def vacuum_table(catalog: str, schema: str, table: str, retain_hours: int):
+    """
+    VACUUM removes old files no longer referenced by the Delta log.
+    WARNING: Ensure all readers are compatible with your retention window.
+    """
+    spark.sql(f"VACUUM {catalog}.{schema}.{table} RETAIN {retain_hours} HOURS")
+    info(f"VACUUM completed on {catalog}.{schema}.{table} with retain={retain_hours}h")
+
+def sanity_queries(catalog: str, schema: str, table: str, limit: int = 20):
+    spark.sql(f"SELECT COUNT(*) AS row_count FROM {catalog}.{schema}.{table}").show()
+    spark.sql(f"SELECT * FROM {catalog}.{schema}.{table} LIMIT {limit}").show(truncate=False)
+
+def run_autoloader_to_table(
+    landing_path: str,
+    checkpoint_dir: str,
+    full_table_name: str,
+    continuous: bool = False,
+    merge_schema: bool = True
+):
+    """
+    Auto Loader from landing_path ➜ Delta table (Unity Catalog) with checkpointing.
+    - continuous=False uses trigger(availableNow=True): job finishes after catching up.
+    - continuous=True keeps streaming until manually stopped.
+    """
+    q = (
+        spark.readStream
+             .format("cloudFiles")
+             .option("cloudFiles.format", "parquet")
+             .option("cloudFiles.inferColumnTypes", "true")
+             .option("rescuedDataColumn", "_rescued_data")
+             .load(landing_path)
+             # .transform(apply_business_transformations)  # Optional: reuse same logic
+             .writeStream
+             .format("delta")
+             .option("checkpointLocation", checkpoint_dir)
+    )
+    if merge_schema:
+        q = q.option("mergeSchema", "true")
+
+    if continuous:
+        info("Starting Auto Loader in CONTINUOUS mode (awaitTermination).")
+        q = q.toTable(full_table_name)
+        # In notebooks, this will keep the cell active; stop manually when needed:
+        spark.streams.awaitAnyTermination()
+    else:
+        info("Running Auto Loader in 'availableNow' mode (batch-like catch-up).")
+        (q.trigger(availableNow=True)
+          .toTable(full_table_name))
+
+# -----------------------------
+# SECTION 3: Main execution
+# -----------------------------
+try:
+    # -- 3.1 Validate inputs
+    assert_non_empty_path(RAW_PARQUET_PATH,  "RAW_PARQUET_PATH")
+    assert_non_empty_path(CONS_DELTA_PATH,   "CONS_DELTA_PATH")
+    full_table_name = f"{CATALOG}.{SCHEMA}.{TABLE_NAME}"
+    info(f"Target UC table: {full_table_name}")
+    info(f"RAW (Parquet):   {RAW_PARQUET_PATH}")
+    info(f"CONS (Delta):    {CONS_DELTA_PATH}")
+
+    # -- 3.2 Ensure UC catalog/schema exist
+    ensure_uc_context(CATALOG, SCHEMA)
+
+    # -- 3.3 Read RAW Parquet
+    info("Reading RAW Parquet...")
+    df_raw = spark.read.format("parquet").load(RAW_PARQUET_PATH)
+    info("RAW schema:")
+    df_raw.printSchema()
+    if PRINT_SAMPLE_ROWS > 0:
+        df_raw.show(PRINT_SAMPLE_ROWS, truncate=False)
+
+    # -- 3.4 Transform (optional; customize apply_business_transformations)
+    info("Applying transformations (edit apply_business_transformations() as needed)...")
+    df_out = apply_business_transformations(df_raw)
+    info("Output schema:")
+    df_out.printSchema()
+
+    # -- 3.5 Write to CONSUMPTION as Delta (creates/updates _delta_log/)
+    info("Writing Delta data to consumption path...")
+    write_delta(
+        df=df_out,
+        delta_path=CONS_DELTA_PATH,
+        mode=WRITE_MODE,
+        partition_cols=PARTITION_COLS,
+        overwrite_schema=OVERWRITE_SCHEMA
+    )
+
+    # -- 3.6 Register/verify UC external table over the Delta folder
+    info("Registering Unity Catalog table on Delta path...")
+    register_uc_table(CATALOG, SCHEMA, TABLE_NAME, CONS_DELTA_PATH)
+
+    # -- 3.7 Optional maintenance: OPTIMIZE + (optional) Z-ORDER
+    if RUN_OPTIMIZE:
+        info("Running OPTIMIZE (and optional Z-ORDER)...")
+        optimize_and_zorder(CATALOG, SCHEMA, TABLE_NAME, ZORDER_COLS)
+
+    # -- 3.8 Optional maintenance: VACUUM
+    if RUN_VACUUM:
+        warn("VACUUM will remove old files. Ensure readers/time travel needs are satisfied.")
+        vacuum_table(CATALOG, SCHEMA, TABLE_NAME, VACUUM_RETAIN_HOURS)
+
+    # -- 3.9 Sanity queries
+    info("Running sanity queries...")
+    sanity_queries(CATALOG, SCHEMA, TABLE_NAME, limit=20)
+
+    # -- 3.10 Optional: Auto Loader for ongoing ingestion
+    if ENABLE_AUTO_LOADER:
+        info("Auto Loader enabled: ingesting from landing path into UC table...")
+        assert_non_empty_path(LANDING_PATH, "LANDING_PATH")
+        assert_non_empty_path(CHECKPOINT_DIR, "CHECKPOINT_DIR")
+        run_autoloader_to_table(
+            landing_path=LANDING_PATH,
+            checkpoint_dir=CHECKPOINT_DIR,
+            full_table_name=full_table_name,
+            continuous=STREAM_CONTINUOUS,
+            merge_schema=STREAM_MERGE_SCHEMA
+        )
+        info("Auto Loader run completed (or streaming started).")
+
+    info("=== Pipeline completed successfully. ===")
+
+    # -- 3.11 (Optional) Table metadata inspection
+    if SHOW_EXTENDED_DESC:
+        info("DESCRIBE EXTENDED (UC table metadata):")
+        describe_table(CATALOG, SCHEMA, TABLE_NAME)
+
+except Exception as e:
+    err("Pipeline failed with an exception:")
+    err(str(e))
+    traceback.print_exc()
+    raise
