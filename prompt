@@ -1,0 +1,44 @@
+You are an expert Databricks administrator with up-to-date knowledge of Unity Catalog and SQL Warehouse permissions.
+
+Context
+- Environment: DEV
+- Single Unity Catalog name: <CATALOG_NAME>
+- Service principal ID: <SERVICE_PRINCIPAL_ID>
+- SQL Warehouse name: <WAREHOUSE_NAME>
+
+Goal
+Produce the exact, copy-paste-ready steps to grant this service principal:
+1) Data privileges across <CATALOG_NAME> so that it can READ and WRITE all tables in ALL current and future schemas under this one catalog.
+   - READ = SELECT
+   - WRITE = MODIFY (with the necessary prerequisites)
+2) The ability to CREATE TABLE in ALL current and future schemas under <CATALOG_NAME>.
+3) Compute privilege “CAN USE” on the SQL Warehouse <WAREHOUSE_NAME> (query/run only; no manage rights).
+4) Do NOT grant CREATE SCHEMA.
+
+Constraints
+- Use only valid Databricks privileges and GRANT syntax per the latest official docs.
+- Leverage catalog-level inheritance so that grants apply to current and future schemas/tables.
+- Be explicit about prerequisite privileges required for MODIFY and CREATE TABLE (e.g., USE CATALOG, USE SCHEMA).
+- If a step must be done via the UI or non-SQL API (e.g., adding “Can use” on a SQL Warehouse), give precise, minimal steps.
+- Do NOT include “ALL PRIVILEGES”.
+- Do NOT include CREATE SCHEMA or any manage/admin privileges beyond what’s required above.
+- Output must be clean and sectioned, with no commentary between code blocks.
+
+Expected Output
+Section 1 — Unity Catalog SQL (single catalog, applies to all current & future schemas):
+- GRANT statements at the catalog level that ensure:
+  a) USE CATALOG on <CATALOG_NAME>
+  b) USE SCHEMA on <CATALOG_NAME> (applies to all current & future schemas)
+  c) SELECT, MODIFY on <CATALOG_NAME> (applies to all current & future tables)
+  d) CREATE TABLE on <CATALOG_NAME> (applies to all current & future schemas)
+- Include only the minimum set of statements needed (no duplicates).
+
+Section 2 — SQL Warehouse permission:
+- Exact UI (or API) steps to add <SERVICE_PRINCIPAL_ID> with “Can use” on <WAREHOUSE_NAME>.
+
+Section 3 — Brief validation notes (1–3 bullets):
+- Confirm that granting at the CATALOG level inherits to all current & future schemas/tables.
+- Note that MODIFY requires SELECT + USE CATALOG + USE SCHEMA.
+- Remind that CREATE TABLE granted on CATALOG applies to existing and future schemas in that catalog.
+
+Replace placeholders with my values and output the final answer.
