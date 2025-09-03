@@ -1,159 +1,31 @@
-<#
-PURPOSE
-  Safely convert CSV files on a UNC/shared path from UTF-16 (LE/BE) to UTF-8
-  (with or without BOM), without corrupting already-UTF-8 files.
+@echo off
+setlocal enabledelayedexpansion
 
-EXIT CODES (for AutoSys / schedulers)
-  0  = success (converted and/or safely skipped)
-  2  = no matching files (benign no-op)
-  10 = at least one file failed to convert
-  20 = shared path missing/misconfigured
-  91 = another instance appears to be running (lock held)
+REM ==================== CONFIG (EDIT THESE IF NEEDED) ====================
+REM PowerShell script location (UNC path; no mapped drives)
+set PS_SCRIPT=\\prod.shsh.net\shhs\djdd\scripts\Convert-CsvUtf16ToUtf8.ps1
 
-SAFETY
-  • Detects encoding via BOM and ONLY converts UTF-16 files (skips others)
-  • Writes to a temp file first, then atomically replaces the original
-  • Uses a lock file on the share to avoid concurrent runs
-  • Retries common share/AV glitches (read/write/rename)
-#>
+REM Folder where incoming CSVs arrive (UNC path)
+set SHARED_PATH=\\prod.shsh.net\shhs\djdd\inbound
 
-[CmdletBinding()]
-param(
-  [Parameter(Mandatory=$true)] [string] $SharedPath,          # e.g., \\prod.shsh.net\shhs\djdd\inbound
-  [string] $FilePattern = '*.csv',                            # e.g., Sales_*.csv
-  [switch] $ProcessAll,                                       # if omitted, only the newest file is processed
-  [int] $MaxFileAgeHrs = 0,                                   # only files modified in last N hours; 0 = ignore
-  [string] $LogRoot = 'C:\AutoSys\logs\CsvUtfConvert',        # local log folder on the agent
-  [switch] $Utf8Bom                                          # include BOM if set; default is no BOM
-)
+REM Which files to process
+set FILE_PATTERN=Sales_*.csv
 
-# Fail fast on unexpected errors
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+REM Local folder on the Windows AutoSys agent for logs
+set LOG_ROOT=C:\AutoSys\logs\CsvUtfConvert
 
-# Prepare logging (transcript + our own timestamped lines)
-$null = New-Item -ItemType Directory -Force -Path $LogRoot
-$runId   = (Get-Date -Format 'yyyyMMdd_HHmmss')
-$logFile = Join-Path $LogRoot "ConvertCsv_$($env:COMPUTERNAME)_$runId.log"
-Start-Transcript -Path $logFile -Append | Out-Null
-function Write-Log { param([string]$m) "$(Get-Date -Format o) :: $m" | Tee-Object -FilePath $logFile -Append | Out-Null }
+REM Output UTF-8 without BOM by default (switch to -Utf8Bom:$true if needed)
+set UTF8_BOM_SWITCH=-Utf8Bom:$false
 
-Write-Log "=== START Convert-CsvUtf16ToUtf8 ==="
-Write-Log "Params: SharedPath='$SharedPath' Pattern='$FilePattern' ProcessAll=$ProcessAll MaxFileAgeHrs=$MaxFileAgeHrs Utf8Bom=$($Utf8Bom.IsPresent)"
+REM Optional behavior:
+REM set PROCESS_ALL_SWITCH=-ProcessAll
+REM set AGE_SWITCH=-MaxFileAgeHrs 24
+REM =======================================================================
 
-# Prevent concurrent runs using a tiny lock file on the share
-$lockPath = Join-Path $SharedPath '.csv_utf_convert.lock'
-$lockStream = $null
-try {
-  $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-  Write-Log "Lock acquired: $lockPath"
-} catch {
-  Write-Log "Another instance appears to be running. Exit 91."
-  Stop-Transcript | Out-Null
-  exit 91
-}
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" ^
+  -SharedPath "%SHARED_PATH%" -FilePattern "%FILE_PATTERN%" -LogRoot "%LOG_ROOT%" ^
+  %UTF8_BOM_SWITCH% %PROCESS_ALL_SWITCH% %AGE_SWITCH%
 
-# Detect encoding by BOM
-function Get-FileEncoding {
-  param([Parameter(Mandatory)][string]$Path)
-  $b = [System.IO.File]::ReadAllBytes($Path)
-  if ($b.Length -ge 3 -and $b[0]-eq0xEF -and $b[1]-eq0xBB -and $b[2]-eq0xBF) { return 'UTF8-BOM' }
-  if ($b.Length -ge 2 -and $b[0]-eq0xFF -and $b[1]-eq0xFE) { return 'UTF16-LE' }
-  if ($b.Length -ge 2 -and $b[0]-eq0xFE -and $b[1]-eq0xFF) { return 'UTF16-BE' }
-  return 'Unknown'  # e.g., UTF-8 (no BOM) / ANSI
-}
-
-# Simple retry helper for transient SMB/AV hiccups
-function Invoke-WithRetry {
-  param(
-    [Parameter(Mandatory)][scriptblock]$Action,
-    [int]$MaxAttempts = 3,
-    [int]$DelaySeconds = 5,
-    [string]$Step = "operation"
-  )
-  for ($i=1; $i -le $MaxAttempts; $i++) {
-    try { return & $Action }
-    catch {
-      if ($i -eq $MaxAttempts) { throw }
-      Write-Log "Retry $i/$MaxAttempts for $Step failed: $($_.Exception.Message). Sleeping ${DelaySeconds}s…"
-      Start-Sleep -Seconds $DelaySeconds
-    }
-  }
-}
-
-# Convert one file: read UTF-16 → write UTF-8 temp → atomic replace
-function Convert-OneFile {
-  param([Parameter(Mandatory)][string]$Path)
-
-  $encFrom = Get-FileEncoding -Path $Path
-  Write-Log "File '$Path' detected encoding: $encFrom"
-
-  if ($encFrom -notin @('UTF16-LE','UTF16-BE')) {
-    Write-Log "Skipping '$Path' (not UTF-16)."
-    return 100  # per-file code used for tallying
-  }
-
-  $srcEnc = if ($encFrom -eq 'UTF16-LE') { [System.Text.Encoding]::Unicode } else { [System.Text.Encoding]::BigEndianUnicode }
-  $utf8   = New-Object System.Text.UTF8Encoding($Utf8Bom.IsPresent)  # with/without BOM
-  $tmp    = "$Path.tmp"
-
-  Invoke-WithRetry -Step "Read $Path" -Action {
-    $reader = New-Object System.IO.StreamReader($Path, $srcEnc, $true)
-    try { $text = $reader.ReadToEnd() } finally { $reader.Close(); $reader.Dispose() }
-    return $text
-  } | Out-Null
-
-  Invoke-WithRetry -Step "Write $tmp" -Action {
-    $writer = New-Object System.IO.StreamWriter($tmp, $false, $utf8)
-    try { $writer.Write($text) } finally { $writer.Close(); $writer.Dispose() }
-  } | Out-Null
-
-  Invoke-WithRetry -Step "Replace original with tmp" -Action {
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
-  } | Out-Null
-
-  Write-Log "Converted '$Path' from $encFrom to UTF-8$([string]::Format(' ({0})',$(if($Utf8Bom){"BOM"}else{"no BOM"})))."
-  return 0
-}
-
-# Discover candidate files
-if (-not (Test-Path -LiteralPath $SharedPath)) {
-  Write-Log "ERROR: SharedPath not found: $SharedPath. Exit 20."
-  $lockStream.Close(); Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
-  Stop-Transcript | Out-Null
-  exit 20
-}
-
-$files = Get-ChildItem -LiteralPath $SharedPath -Filter $FilePattern -File -ErrorAction Stop |
-         Sort-Object LastWriteTime -Descending
-
-if ($MaxFileAgeHrs -gt 0) {
-  $threshold = (Get-Date).AddHours(-1 * $MaxFileAgeHrs)
-  $files = $files | Where-Object { $_.LastWriteTime -ge $threshold }
-  Write-Log "Filtered by last write >= $threshold"
-}
-
-if (-not $files) {
-  Write-Log "No matching files. Exit 2."
-  $lockStream.Close(); Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
-  Stop-Transcript | Out-Null
-  exit 2
-}
-
-if (-not $ProcessAll) { $files = @($files | Select-Object -First 1) }
-
-# Process loop
-$total=$files.Count; $ok=0; $skip=0; $fail=0
-foreach($f in $files){
-  try   { $rc = Convert-OneFile -Path $f.FullName; if($rc -eq 0){$ok++} elseif($rc -eq 100){$skip++} else{$fail++} }
-  catch { Write-Log "ERROR converting '$($f.FullName)': $($_.Exception.Message)"; $fail++ }
-}
-
-Write-Log "Summary: total=$total success=$ok skipped=$skip failed=$fail"
-
-# Cleanup lock + transcript
-$lockStream.Close(); Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
-Stop-Transcript | Out-Null
-
-if ($fail -gt 0) { exit 10 }
-exit 0
+set RC=%ERRORLEVEL%
+echo PowerShell returned %RC%
+endlocal & exit /b %RC%
