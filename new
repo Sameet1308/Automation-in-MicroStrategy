@@ -1,0 +1,49 @@
+As discussed, we are implementing a daily conversion process for CSV files that currently arrive in UTF-16 format and need to be converted to UTF-8 for downstream applications.
+
+I am sharing with you the following artifacts for deployment and thorough testing in the DEV environment before promoting further:
+	1.	PowerShell script (Convert-CsvUtf16ToUtf8.ps1) – Converts files safely with logging, retries, and lock handling.
+	2.	Batch wrapper (run_convert_utf8.bat) – Calls the PowerShell script with parameters.
+	3.	Sample AutoSys JIL – For scheduling on the Windows AutoSys agent.
+
+⸻
+
+Request
+	•	Please deploy the script and batch file to the designated AutoSys Windows agent.
+	•	Ensure the service account has Read/Write/Delete access to the shared folder and log folder.
+	•	Run the job both manually (via batch file) and through AutoSys to validate.
+	•	Capture evidence of test results (logs, file encoding before/after).
+
+⸻
+
+Test Plan
+	1.	Place a sample UTF-16 CSV file (with non-ASCII characters) in the target folder.
+	2.	Run the batch file directly → confirm conversion to UTF-8.
+	3.	Schedule/trigger via AutoSys → confirm same behavior.
+	4.	Re-run on an already converted file → should log “skipped” without corruption.
+	5.	Verify logs at C:\AutoSys\logs\CsvUtfConvert.
+	6.	Negative cases:
+	•	No matching files → job exits with code 2 (no alarm expected).
+	•	Locked file → retries, then clear error in logs.
+	•	Permission issues → logged failure with non-zero exit code.
+
+⸻
+
+Troubleshooting Checklist
+	•	Exit codes:
+	•	0 = Success
+	•	2 = No matching files
+	•	10 = Conversion failure(s)
+	•	20 = Shared path missing
+	•	91 = Another instance running
+	•	Common issues:
+	•	Access denied → check share/NTFS permissions (Delete required).
+	•	No logs → ensure local log folder exists with write permissions.
+	•	AutoSys fails but manual works → confirm the agent’s service account.
+
+⸻
+
+Next Steps
+
+Please complete testing in DEV and confirm once everything works as expected. After sign-off, we’ll proceed with higher environments.
+
+Thanks for your support,
