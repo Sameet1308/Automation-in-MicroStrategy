@@ -1,0 +1,60 @@
+MicroStrategy Project Performance Settings: Summary
+This summary explains the key project‑level governors and cache settings in MicroStrategy that directly or indirectly influence dashboard performance. For each governor, it briefly states what the setting controls, the default value (when documented), and why administrators might adjust it. Citations refer to the official MicroStrategy System Administration documentation.
+
+Memory and Result‑Set Governors
+These settings control how much memory the Intelligence Server will use for query planning and data retrieval, and they impose limits on result‑set sizes. Raising memory limits can improve performance by avoiding spill‑to‑disk operations, but administrators must ensure the server has enough RAM.
+
+Memory consumption during SQL generation (MB) – Limits the RAM used when building SQL/query plans. The default is ‑1 (no limit)【958129985971406†L190-L195】. Increasing this allows complex query plans to be built entirely in memory, reducing plan‑generation latency. However, on servers with limited memory this may starve other processes.
+Memory consumption during data fetching (MB) – Caps RAM used while importing or fetching data. The default is 2,048 MB (2 GB)【958129985971406†L190-L195】. Raising it (for example, to 8 GB or more) allows larger joins and aggregations to be processed in memory, which speeds up report execution. Too high a value may cause the operating system to swap.
+Final result rows – Document/Dashboard views – Sets the maximum number of rows that a document or dashboard request may return. The default is 50 million rows【958129985971406†L163-L168】. It prevents runaway queries; lowering it protects resources, while raising it allows larger result sets.
+All intermediate result rows – Document/Dashboard views – Limits the size of intermediate working sets produced during query processing. The default is 32 000 rows【958129985971406†L175-L183】. Raising this helps when filters or joins produce intermediate results larger than 32 k rows; lowering it enforces stricter memory use.
+Job and Session Concurrency Governors
+Concurrency governors restrict how many jobs or sessions can run simultaneously, protecting the server from overload. If they are too low, users may experience queuing; if too high, the server may run out of resources.
+
+Jobs per user account / Jobs per user session – Specify the maximum number of concurrent jobs a user or a single session can execute. When the limit is reached, additional jobs queue until earlier ones finish【958129985971406†L214-L233】. Raising these values lets power users run more analyses in parallel.
+Executing jobs per user – Caps how many jobs a user can have executing at once. Excess jobs are placed in a queue【958129985971406†L226-L233】. Increasing this can help heavy users; decreasing it prevents a single user from monopolizing server resources.
+Jobs per project (interactive/scheduled) – Define the total number of concurrent jobs a project may process for interactive and scheduled requests【958129985971406†L234-L244】. Raising them allows more workload concurrency; lowering them protects resources for other projects.
+User sessions per project – The maximum number of user sessions allowed in the project. Exceeding this limit blocks new logins (except for administrators)【958129985971406†L262-L266】. Set high enough for expected user load but low enough to avoid memory exhaustion.
+Concurrent interactive project sessions per user – Limits how many concurrent sessions each user can open【958129985971406†L269-L273】. Higher values support multi‑tab workflows; lower values prevent session hoarding.
+Result‑Cache Settings (Datasets and Documents)
+MicroStrategy caches results to avoid re‑executing queries. The following governors control memory reserved for these caches and how they behave. Allocating too little memory causes cache evictions and re‑execution; too much memory can starve other processes.
+
+Datasets – Maximum RAM usage (MB) – The amount of memory reserved for report and dataset caches. It should be at least the size of the largest cache; otherwise that cache cannot be stored【958129985971406†L368-L373】. Raise this setting to keep frequently used datasets in memory.
+Datasets – Maximum number of caches – The maximum number of dataset caches the project can hold. In recent releases the setting is retired and defaults to 10 000; values below that are not enforced【958129985971406†L376-L383】.
+Formatted Documents – Maximum RAM usage (MB) – Memory reserved for document caches. It should be at least the size of the largest formatted document cache【958129985971406†L387-L392】. Increasing this keeps rendered dossier pages in memory, improving subsequent opens.
+Formatted Documents – Maximum number of caches – The maximum number of document caches. Like the dataset limit, this setting is retired and defaults to 100 000【958129985971406†L395-L401】.
+RAM swap multiplier – Controls how much data is swapped to disk when loading a cache from disk into RAM. With a multiplier of 2, loading an 80 KB cache causes 160 KB to be swapped out【958129985971406†L405-L409】. Higher values free more memory but increase disk I/O.
+Maximum RAM for report cache index (% ) – Sets what percentage of cache memory can be used for lookup tables in the result cache【958129985971406†L414-L417】. A high value speeds cache lookups but leaves less memory for storing actual data.
+Never expire caches / Cache duration (Hours) – Determines whether caches expire automatically and, if so, how long they remain valid. A typical default is 24 hours【958129985971406†L433-L440】. Align cache lifetimes with your data refresh schedule; avoid “never expire” unless the data never changes.
+Do not apply Automatic Expiration Logic for reports containing dynamic dates – When checked, caches for dynamic‑date reports expire like other caches rather than immediately【958129985971406†L444-L447】.
+Load caches on startup – When enabled, caches are loaded into memory when the Intelligence Server starts, reducing latency for the first user. If disabled, caches load on demand【958129985971406†L429-L449】.
+Auxiliary Caches (Objects and Elements)
+Auxiliary caches store metadata objects (like attributes and metrics) and attribute element lists (filter values). Increasing these caches improves user interface responsiveness.
+
+Server – Maximum RAM usage (object cache) – Memory allocated for object caching. Larger values reduce repeated parsing of schema objects【958129985971406†L459-L464】.
+Client – Maximum RAM usage (object cache) – Memory allocated by MicroStrategy Developer for object caching【958129985971406†L465-L468】.
+Server – Maximum RAM usage (element cache) – Memory reserved for attribute element lists【958129985971406†L479-L483】. Raising it helps selectors with many distinct values load faster.
+Client – Maximum RAM usage (element cache) – Memory reserved on the client side for element caches【958129985971406†L485-L489】.
+Intelligent Cube Governors
+Intelligent Cubes accelerate dashboards by holding aggregated data in memory. These governors control memory allocated to cubes and help prevent cubes from using excessive memory.
+
+Maximum RAM usage for Intelligent Cubes (MB) – Caps the total memory that a project can use to store cubes. The default is 256 MB【218016780422981†L300-L307】. Increasing this allows more or larger cubes to remain loaded, improving dashboard responsiveness. If the limit is reached, least‑used cubes unload automatically.
+Maximum number of cubes – The maximum number of cubes that can be loaded. This setting is retired; values below the default of 100 000 are not enforced【218016780422981†L300-L313】.
+Maximum cube size allowed for download (MB) – Restricts how large a cube can be when exported or emailed. Prevents extremely large downloads from consuming resources【218016780422981†L317-L319】.
+Maximum % growth of an Intelligent Cube due to indexes – Limits how much index creation can inflate cube size【218016780422981†L343-L367】. Lower percentages conserve memory; higher percentages improve query performance at the cost of RAM.
+Cube growth check frequency (mins) – Determines how often the server examines cube sizes and drops least‑used indexes to stay within growth limits【218016780422981†L343-L367】.
+Import Data Governors
+When users import files to create personal cubes, these governors prevent oversized imports from consuming too much memory.
+
+Maximum file size (MB) – The largest file size allowed for data import. Files exceeding this cannot be used as data sources【958129985971406†L345-L349】. Set this based on server memory and business needs.
+Maximum quota per user (MB) – Caps the total size of all import cubes a user can own【958129985971406†L353-L356】. Helps manage storage and memory consumption per user.
+Filter Evaluation Mode (MicroStrategy 2025+)
+In MicroStrategy 2025 and later, a project definition option lets you choose between Default and Optimized dashboard filter evaluation modes. The Optimized mode uses a view‑based approach to evaluate filters, which can significantly improve filter response times【78649483869630†L281-L292】. Choose Default only if your dashboards rely on complex custom groups or expressions not supported by the optimized method.
+
+How to Use This Summary
+Review memory and result‑set governors first. These often have the biggest impact on initial query performance. Increase memory limits carefully and only on servers with sufficient RAM.
+Balance concurrency governors to permit parallelism without overwhelming the server. Monitor job queues and adjust limits as user demand grows.
+Right‑size cache memory so that frequently used datasets and document pages stay in memory, but caches do not exhaust system memory. Align cache expiration with your data refresh schedule.
+Tune auxiliary caches and cube memory to reduce metadata and selector latency and to keep important cubes loaded.
+Enforce sensible import limits if users create personal cubes. Prevent extremely large imports from overloading the server.
+By tuning these governors based on your hardware and workload—and by adopting optimized filter evaluation modes—administrators can ensure that dashboards remain responsive even when data volumes and user concurrency grow.
