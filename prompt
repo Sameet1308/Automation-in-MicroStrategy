@@ -1,6 +1,14 @@
 <style>
-/* Hide only the Library icon */
+/* Remove the default blue bookshelf graphic */
+.mstrd-LibraryNavItem-link .mstr-nav-icon.icon-library:before {
+    content: none !important;
+}
+
+/* Make the icon div still occupy space so the link stays clickable */
 .mstrd-LibraryNavItem-link .mstr-nav-icon.icon-library {
-    display: none !important;
+    background: none !important;
+    width: 32px !important;   /* keep some size */
+    height: 32px !important;
+    display: inline-block !important;
 }
 </style>
