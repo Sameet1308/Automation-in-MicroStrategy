@@ -1,12 +1,6 @@
 <style>
-.mstr-nav-icon.icon-library {
-    background-image: url("https://yourserver-or-naspath/myLogo.png") !important;
-    background-size: contain !important;
-    background-repeat: no-repeat !important;
-    background-position: center !important;
-    border-radius: 0 !important; /* removes blue circle */
-}
-.mstr-nav-icon.icon-library:before {
-    content: none !important;
+/* Hide only the Library icon */
+.mstrd-LibraryNavItem-link .mstr-nav-icon.icon-library {
+    display: none !important;
 }
 </style>
