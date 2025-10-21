@@ -1,1 +1,686 @@
-z
+# ============================================================================
+# CELL 1: Install Required Packages
+# ============================================================================
+# %pip install requests>=2.32.0 pandas>=2.2.0 urllib3>=2.2.0
+
+
+# ============================================================================
+# CELL 2: Complete MicroStrategy Dossier Extractor
+# ============================================================================
+
+#!/usr/bin/env python3
+"""
+MicroStrategy Dossier Definition Extractor - Complete Databricks Version
+========================================================================
+All-in-one script for extracting dossier definitions in Databricks
+"""
+
+import requests
+import json
+import urllib3
+from urllib3.exceptions import InsecureRequestWarning
+import pandas as pd
+import warnings
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+
+# Disable SSL warnings
+urllib3.disable_warnings(InsecureRequestWarning)
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# INPUT PARAMETERS - CHANGE THESE VALUES
+# ============================================================================
+
+LIBRARY_URL = "https://your-server/MicroStrategyLibrary"  # CHANGE THIS
+USERNAME = "your-username"                                  # CHANGE THIS
+PASSWORD = "your-password"                                  # CHANGE THIS
+PROJECT_ID = None                                          # Optional - leave None for auto-detect
+DOSSIER_ID = None                                          # Optional - leave None to extract ALL dossiers
+OUTPUT_PREFIX = "dossier_extraction"                       # Output file prefix
+EXTRACT_ALL = True                                         # True = extract all dossiers, False = single dossier
+
+# Optional: Catalog and Schema for Delta tables
+CATALOG_NAME = "your_catalog"                              # CHANGE THIS
+SCHEMA_NAME = "your_schema"                                # CHANGE THIS
+SAVE_TO_DELTA = True                                       # True = save to Delta tables
+
+# ============================================================================
+# EXTRACTOR CLASS
+# ============================================================================
+
+class MicroStrategyExtractor:
+    """Main extractor class for MicroStrategy dossier definitions"""
+    
+    def __init__(self, library_url: str, username: str, password: str, project_id: Optional[str] = None):
+        self.library_url = library_url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.project_id = project_id
+        self.session = requests.Session()
+        self.session.verify = False
+        self.auth_token = None
+        
+    def authenticate(self) -> bool:
+        """Authenticate with MicroStrategy"""
+        try:
+            print(f"Authenticating with MicroStrategy...")
+            auth_url = f"{self.library_url}/api/auth/login"
+            auth_payload = {"username": self.username, "password": self.password}
+            auth_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            
+            response = self.session.post(auth_url, json=auth_payload, headers=auth_headers)
+            response.raise_for_status()
+            
+            self.auth_token = response.headers.get('X-MSTR-AuthToken')
+            if not self.auth_token:
+                raise Exception("No auth token received")
+            
+            print("✓ Authentication successful")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Authentication failed: {e}")
+            return False
+    
+    def get_projects(self) -> List[Dict]:
+        """Get list of all projects"""
+        try:
+            projects_url = f"{self.library_url}/api/projects"
+            headers = {"X-MSTR-AuthToken": self.auth_token, "Accept": "application/json"}
+            
+            response = self.session.get(projects_url, headers=headers)
+            response.raise_for_status()
+            
+            return response.json()
+            
+        except Exception as e:
+            print(f"✗ Error fetching projects: {e}")
+            return []
+    
+    def set_project(self, project_id: str) -> None:
+        """Set the project ID"""
+        self.project_id = project_id
+    
+    def get_all_dossiers(self) -> List[Dict]:
+        """Get list of ALL dossiers in the project"""
+        try:
+            print(f"Fetching all dossiers in project...")
+            
+            search_url = f"{self.library_url}/api/searches/results"
+            headers = {
+                "X-MSTR-AuthToken": self.auth_token,
+                "X-MSTR-ProjectId": self.project_id,
+                "Accept": "application/json"
+            }
+            
+            params = {
+                "type": 55,  # Dossier object type
+                "getTree": False,
+                "isCrossCluster": False,
+                "offset": 0,
+                "limit": -1
+            }
+            
+            response = self.session.get(search_url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            results = response.json()
+            dossiers = results.get('result', [])
+            
+            print(f"✓ Found {len(dossiers)} dossiers in project")
+            return dossiers
+            
+        except Exception as e:
+            print(f"✗ Error fetching dossiers: {e}")
+            return []
+    
+    def get_dossier_definition(self, dossier_id: str) -> Optional[Dict]:
+        """Get dossier definition"""
+        try:
+            definition_url = f"{self.library_url}/api/v2/dossiers/{dossier_id}/definition"
+            headers = {
+                "X-MSTR-AuthToken": self.auth_token,
+                "X-MSTR-ProjectId": self.project_id,
+                "Accept": "application/json"
+            }
+            
+            response = self.session.get(definition_url, headers=headers)
+            response.raise_for_status()
+            
+            return response.json()
+            
+        except Exception as e:
+            print(f"✗ Error fetching definition for dossier {dossier_id}: {e}")
+            return None
+    
+    def extract_single_dossier(self, dossier_id: str) -> Optional[Dict]:
+        """Extract definition from a single dossier"""
+        print(f"\nExtracting dossier: {dossier_id}")
+        
+        definition = self.get_dossier_definition(dossier_id)
+        if not definition:
+            return None
+        
+        return self._process_definition(dossier_id, definition)
+    
+    def extract_all_dossiers(self) -> List[Dict]:
+        """Extract definitions from ALL dossiers in project"""
+        dossiers = self.get_all_dossiers()
+        
+        if not dossiers:
+            print("No dossiers found")
+            return []
+        
+        results = []
+        
+        for i, dossier in enumerate(dossiers, 1):
+            dossier_id = dossier.get('id')
+            dossier_name = dossier.get('name', 'Unknown')
+            
+            print(f"\n[{i}/{len(dossiers)}] Extracting: {dossier_name} ({dossier_id})")
+            
+            result = self.extract_single_dossier(dossier_id)
+            if result:
+                results.append(result)
+                print(f"  ✓ Metrics: {len(result['derived_metrics'])}, Attributes: {len(result['derived_attributes'])}")
+            else:
+                print(f"  ✗ Failed to extract")
+        
+        return results
+    
+    def _process_definition(self, dossier_id: str, definition: Dict) -> Dict:
+        """Process dossier definition and extract objects"""
+        result = {
+            "extraction_info": {
+                "dossier_id": dossier_id,
+                "library_url": self.library_url,
+                "project_id": self.project_id,
+                "extraction_timestamp": datetime.now().isoformat()
+            },
+            "dossier_info": {
+                "id": dossier_id,
+                "name": definition.get('name', 'Unknown'),
+                "description": definition.get('description', ''),
+                "project_id": self.project_id
+            },
+            "derived_metrics": [],
+            "derived_attributes": [],
+            "all_objects": [],
+            "datasets": []
+        }
+        
+        datasets = definition.get('datasets', [])
+        
+        for dataset in datasets:
+            dataset_info = {
+                "id": dataset.get('id'),
+                "name": dataset.get('name'),
+                "type": dataset.get('type', 'Unknown'),
+                "objects_count": len(dataset.get('availableObjects', []))
+            }
+            result["datasets"].append(dataset_info)
+            
+            for obj in dataset.get('availableObjects', []):
+                obj_details = {
+                    "id": obj.get('id'),
+                    "name": obj.get('name'),
+                    "type": obj.get('type'),
+                    "subtype": obj.get('subType'),
+                    "description": obj.get('description', ''),
+                    "dataset_id": dataset.get('id'),
+                    "dataset_name": dataset.get('name'),
+                    "dataset_type": dataset.get('type', 'Unknown'),
+                    "dossier_id": dossier_id,
+                    "dossier_name": definition.get('name', 'Unknown')
+                }
+                
+                if obj.get('type') == 'attribute':
+                    forms = obj.get('forms', [])
+                    obj_details["forms"] = str(forms)  # Convert to string for Spark compatibility
+                    obj_details["forms_count"] = len(forms)
+                    obj_details["form_names"] = str([form.get('name', '') for form in forms])
+                elif obj.get('type') == 'metric':
+                    obj_details["metric_type"] = obj.get('subType', 'Unknown')
+                
+                result["all_objects"].append(obj_details)
+                
+                if obj.get('type') == 'metric':
+                    result["derived_metrics"].append(obj_details)
+                elif obj.get('type') == 'attribute':
+                    result["derived_attributes"].append(obj_details)
+        
+        return result
+    
+    def logout(self) -> None:
+        """Logout and cleanup session"""
+        try:
+            if self.auth_token:
+                logout_url = f"{self.library_url}/api/auth/logout"
+                headers = {"X-MSTR-AuthToken": self.auth_token}
+                self.session.post(logout_url, headers=headers, timeout=5)
+        except:
+            pass
+
+
+def create_spark_dataframes(results: List[Dict]):
+    """Convert results to Spark DataFrames"""
+    
+    all_metrics = []
+    all_attributes = []
+    all_objects = []
+    all_datasets = []
+    all_dossier_info = []
+    
+    for result in results:
+        all_metrics.extend(result['derived_metrics'])
+        all_attributes.extend(result['derived_attributes'])
+        all_objects.extend(result['all_objects'])
+        all_datasets.extend(result['datasets'])
+        all_dossier_info.append(result['dossier_info'])
+    
+    dataframes = {}
+    
+    if all_metrics:
+        df_metrics = spark.createDataFrame(pd.DataFrame(all_metrics))
+        dataframes['metrics'] = df_metrics
+        print(f"✓ Created metrics DataFrame: {df_metrics.count()} rows")
+    
+    if all_attributes:
+        df_attributes = spark.createDataFrame(pd.DataFrame(all_attributes))
+        dataframes['attributes'] = df_attributes
+        print(f"✓ Created attributes DataFrame: {df_attributes.count()} rows")
+    
+    if all_objects:
+        df_objects = spark.createDataFrame(pd.DataFrame(all_objects))
+        dataframes['objects'] = df_objects
+        print(f"✓ Created objects DataFrame: {df_objects.count()} rows")
+    
+    if all_datasets:
+        df_datasets = spark.createDataFrame(pd.DataFrame(all_datasets))
+        dataframes['datasets'] = df_datasets
+        print(f"✓ Created datasets DataFrame: {df_datasets.count()} rows")
+    
+    if all_dossier_info:
+        df_dossiers = spark.createDataFrame(pd.DataFrame(all_dossier_info))
+        dataframes['dossiers'] = df_dossiers
+        print(f"✓ Created dossiers DataFrame: {df_dossiers.count()} rows")
+    
+    return dataframes
+
+
+def save_to_delta_tables(dataframes: Dict, catalog: str, schema: str):
+    """Save DataFrames to Delta tables"""
+    
+    if dataframes.get('metrics'):
+        table_name = f"{catalog}.{schema}.mstr_derived_metrics"
+        dataframes['metrics'].write.mode("overwrite").saveAsTable(table_name)
+        print(f"✓ Saved to {table_name}")
+    
+    if dataframes.get('attributes'):
+        table_name = f"{catalog}.{schema}.mstr_derived_attributes"
+        dataframes['attributes'].write.mode("overwrite").saveAsTable(table_name)
+        print(f"✓ Saved to {table_name}")
+    
+    if dataframes.get('objects'):
+        table_name = f"{catalog}.{schema}.mstr_all_objects"
+        dataframes['objects'].write.mode("overwrite").saveAsTable(table_name)
+        print(f"✓ Saved to {table_name}")
+    
+    if dataframes.get('datasets'):
+        table_name = f"{catalog}.{schema}.mstr_datasets"
+        dataframes['datasets'].write.mode("overwrite").saveAsTable(table_name)
+        print(f"✓ Saved to {table_name}")
+    
+    if dataframes.get('dossiers'):
+        table_name = f"{catalog}.{schema}.mstr_dossiers_summary"
+        dataframes['dossiers'].write.mode("overwrite").saveAsTable(table_name)
+        print(f"✓ Saved to {table_name}")
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+print("="*80)
+print("MicroStrategy Dossier Definition Extractor")
+print("="*80)
+print(f"\nConfiguration:")
+print(f"  Library URL: {LIBRARY_URL}")
+print(f"  Username: {USERNAME}")
+print(f"  Project ID: {PROJECT_ID or 'Auto-detect'}")
+print(f"  Dossier ID: {DOSSIER_ID or 'Extract all'}")
+print(f"  Extract All: {EXTRACT_ALL}")
+print(f"  Output Prefix: {OUTPUT_PREFIX}")
+print(f"  Save to Delta: {SAVE_TO_DELTA}")
+if SAVE_TO_DELTA:
+    print(f"  Catalog: {CATALOG_NAME}")
+    print(f"  Schema: {SCHEMA_NAME}")
+print("="*80)
+
+# Validate parameters
+if not LIBRARY_URL or not USERNAME or not PASSWORD:
+    raise ValueError("LIBRARY_URL, USERNAME, and PASSWORD are required!")
+
+# Initialize extractor
+extractor = MicroStrategyExtractor(
+    library_url=LIBRARY_URL,
+    username=USERNAME,
+    password=PASSWORD,
+    project_id=PROJECT_ID
+)
+
+# Authenticate
+if not extractor.authenticate():
+    raise Exception("Authentication failed!")
+
+# Get/set project
+if not PROJECT_ID:
+    projects = extractor.get_projects()
+    if not projects:
+        raise Exception("No projects found")
+    extractor.set_project(projects[0]['id'])
+    print(f"\n✓ Using project: {projects[0]['name']} (ID: {projects[0]['id']})")
+else:
+    print(f"\n✓ Using project ID: {PROJECT_ID}")
+
+# Extract dossiers
+if EXTRACT_ALL or not DOSSIER_ID:
+    # Extract all dossiers
+    print("\n" + "="*80)
+    print("Extracting ALL dossiers...")
+    print("="*80)
+    results = extractor.extract_all_dossiers()
+else:
+    # Extract single dossier
+    print("\n" + "="*80)
+    print(f"Extracting single dossier: {DOSSIER_ID}")
+    print("="*80)
+    result = extractor.extract_single_dossier(DOSSIER_ID)
+    results = [result] if result else []
+
+# Cleanup
+extractor.logout()
+
+# Summary
+print("\n" + "="*80)
+print("EXTRACTION COMPLETE!")
+print("="*80)
+print(f"Total dossiers processed: {len(results)}")
+
+total_metrics = sum(len(r['derived_metrics']) for r in results)
+total_attributes = sum(len(r['derived_attributes']) for r in results)
+total_objects = sum(len(r['all_objects']) for r in results)
+
+print(f"Total derived metrics: {total_metrics}")
+print(f"Total derived attributes: {total_attributes}")
+print(f"Total objects: {total_objects}")
+print("="*80)
+
+# Create Spark DataFrames
+print("\nCreating Spark DataFrames...")
+dataframes = create_spark_dataframes(results)
+
+# Save to Delta tables if enabled
+if SAVE_TO_DELTA and dataframes:
+    print("\nSaving to Delta tables...")
+    save_to_delta_tables(dataframes, CATALOG_NAME, SCHEMA_NAME)
+
+# Store DataFrames as global variables for access in other cells
+df_metrics = dataframes.get('metrics')
+df_attributes = dataframes.get('attributes')
+df_objects = dataframes.get('objects')
+df_datasets = dataframes.get('datasets')
+df_dossiers = dataframes.get('dossiers')
+
+print("\n" + "="*80)
+print("SUCCESS! DataFrames are ready:")
+print("  - df_metrics")
+print("  - df_attributes")
+print("  - df_objects")
+print("  - df_datasets")
+print("  - df_dossiers")
+print("="*80)
+
+
+# ============================================================================
+# CELL 3: Display Sample Results
+# ============================================================================
+
+# Display sample data from extracted dossiers
+
+print("="*80)
+print("DERIVED METRICS SAMPLE")
+print("="*80)
+if df_metrics:
+    display(df_metrics.limit(20))
+else:
+    print("No metrics found")
+
+print("\n" + "="*80)
+print("DERIVED ATTRIBUTES SAMPLE")
+print("="*80)
+if df_attributes:
+    display(df_attributes.limit(20))
+else:
+    print("No attributes found")
+
+print("\n" + "="*80)
+print("DOSSIERS SUMMARY")
+print("="*80)
+if df_dossiers:
+    display(df_dossiers)
+else:
+    print("No dossiers found")
+
+print("\n" + "="*80)
+print("ALL OBJECTS SAMPLE")
+print("="*80)
+if df_objects:
+    display(df_objects.limit(20))
+else:
+    print("No objects found")
+
+
+# ============================================================================
+# CELL 4: Query and Analyze Results
+# ============================================================================
+
+# Example queries on the extracted data
+
+print("="*80)
+print("ANALYSIS AND QUERIES")
+print("="*80)
+
+# Count metrics per dossier
+if df_metrics:
+    print("\n1. METRICS COUNT PER DOSSIER:")
+    print("-" * 80)
+    df_metrics.groupBy("dossier_name", "dossier_id").count() \
+        .orderBy("count", ascending=False) \
+        .withColumnRenamed("count", "metrics_count") \
+        .show(20, False)
+
+# Count attributes per dossier
+if df_attributes:
+    print("\n2. ATTRIBUTES COUNT PER DOSSIER:")
+    print("-" * 80)
+    df_attributes.groupBy("dossier_name", "dossier_id").count() \
+        .orderBy("count", ascending=False) \
+        .withColumnRenamed("count", "attributes_count") \
+        .show(20, False)
+
+# Show all object types distribution
+if df_objects:
+    print("\n3. OBJECT TYPES DISTRIBUTION:")
+    print("-" * 80)
+    df_objects.groupBy("type", "subtype").count() \
+        .orderBy("count", ascending=False) \
+        .show(50, False)
+
+# Metrics by type
+if df_metrics:
+    print("\n4. METRICS BY TYPE:")
+    print("-" * 80)
+    df_metrics.groupBy("metric_type").count() \
+        .orderBy("count", ascending=False) \
+        .show(50, False)
+
+# Datasets summary
+if df_datasets:
+    print("\n5. DATASETS SUMMARY:")
+    print("-" * 80)
+    df_datasets.groupBy("type").count() \
+        .orderBy("count", ascending=False) \
+        .show(50, False)
+
+# Objects per dataset
+if df_objects:
+    print("\n6. TOP 20 DATASETS BY OBJECT COUNT:")
+    print("-" * 80)
+    df_objects.groupBy("dataset_name", "dataset_type").count() \
+        .orderBy("count", ascending=False) \
+        .withColumnRenamed("count", "objects_count") \
+        .show(20, False)
+
+print("\n" + "="*80)
+print("ANALYSIS COMPLETE!")
+print("="*80)
+
+
+# ============================================================================
+# CELL 5: Export to CSV (Optional)
+# ============================================================================
+
+# Export DataFrames to CSV files in DBFS
+
+OUTPUT_PATH = f"/dbfs/mnt/data/{OUTPUT_PREFIX}"  # CHANGE THIS PATH
+
+try:
+    print("="*80)
+    print("EXPORTING TO CSV FILES")
+    print("="*80)
+    print(f"Output path: {OUTPUT_PATH}")
+    print("-" * 80)
+    
+    if df_metrics:
+        csv_path = f"{OUTPUT_PATH}_metrics.csv"
+        df_metrics.toPandas().to_csv(csv_path, index=False)
+        print(f"✓ Exported metrics to: {csv_path}")
+    
+    if df_attributes:
+        csv_path = f"{OUTPUT_PATH}_attributes.csv"
+        df_attributes.toPandas().to_csv(csv_path, index=False)
+        print(f"✓ Exported attributes to: {csv_path}")
+    
+    if df_objects:
+        csv_path = f"{OUTPUT_PATH}_all_objects.csv"
+        df_objects.toPandas().to_csv(csv_path, index=False)
+        print(f"✓ Exported all objects to: {csv_path}")
+    
+    if df_datasets:
+        csv_path = f"{OUTPUT_PATH}_datasets.csv"
+        df_datasets.toPandas().to_csv(csv_path, index=False)
+        print(f"✓ Exported datasets to: {csv_path}")
+    
+    if df_dossiers:
+        csv_path = f"{OUTPUT_PATH}_dossiers_summary.csv"
+        df_dossiers.toPandas().to_csv(csv_path, index=False)
+        print(f"✓ Exported dossiers summary to: {csv_path}")
+    
+    print("\n" + "="*80)
+    print("CSV EXPORT COMPLETE!")
+    print("="*80)
+    
+except Exception as e:
+    print(f"✗ Error exporting to CSV: {e}")
+    print("Note: Make sure the output path exists and is writable")
+
+
+# ============================================================================
+# CELL 6: Create Summary Report
+# ============================================================================
+
+# Generate a comprehensive summary report
+
+print("="*80)
+print("COMPREHENSIVE SUMMARY REPORT")
+print("="*80)
+
+# Overall statistics
+print("\n" + "="*80)
+print("OVERALL STATISTICS")
+print("="*80)
+
+if df_dossiers:
+    total_dossiers = df_dossiers.count()
+    print(f"Total Dossiers Processed: {total_dossiers}")
+
+if df_metrics:
+    total_metrics = df_metrics.count()
+    unique_metrics = df_metrics.select("id").distinct().count()
+    print(f"Total Metrics: {total_metrics}")
+    print(f"Unique Metrics: {unique_metrics}")
+
+if df_attributes:
+    total_attributes = df_attributes.count()
+    unique_attributes = df_attributes.select("id").distinct().count()
+    print(f"Total Attributes: {total_attributes}")
+    print(f"Unique Attributes: {unique_attributes}")
+
+if df_objects:
+    total_objects = df_objects.count()
+    print(f"Total Objects: {total_objects}")
+
+if df_datasets:
+    total_datasets = df_datasets.count()
+    print(f"Total Datasets: {total_datasets}")
+
+# Top dossiers by complexity
+print("\n" + "="*80)
+print("TOP 10 MOST COMPLEX DOSSIERS (by object count)")
+print("="*80)
+if df_objects:
+    from pyspark.sql import functions as F
+    
+    complexity_df = df_objects.groupBy("dossier_name", "dossier_id").agg(
+        F.count("*").alias("total_objects"),
+        F.countDistinct(F.when(F.col("type") == "metric", F.col("id"))).alias("metrics"),
+        F.countDistinct(F.when(F.col("type") == "attribute", F.col("id"))).alias("attributes")
+    ).orderBy("total_objects", ascending=False)
+    
+    display(complexity_df.limit(10))
+
+# Dossiers with most metrics
+print("\n" + "="*80)
+print("TOP 10 DOSSIERS BY METRICS COUNT")
+print("="*80)
+if df_metrics:
+    metrics_by_dossier = df_metrics.groupBy("dossier_name", "dossier_id").count() \
+        .orderBy("count", ascending=False) \
+        .withColumnRenamed("count", "metrics_count")
+    
+    display(metrics_by_dossier.limit(10))
+
+# Dossiers with most attributes
+print("\n" + "="*80)
+print("TOP 10 DOSSIERS BY ATTRIBUTES COUNT")
+print("="*80)
+if df_attributes:
+    attributes_by_dossier = df_attributes.groupBy("dossier_name", "dossier_id").count() \
+        .orderBy("count", ascending=False) \
+        .withColumnRenamed("count", "attributes_count")
+    
+    display(attributes_by_dossier.limit(10))
+
+print("\n" + "="*80)
+print("REPORT COMPLETE!")
+print("="*80)
+print(f"\nAll data is available in the following tables:")
+if SAVE_TO_DELTA:
+    print(f"  - {CATALOG_NAME}.{SCHEMA_NAME}.mstr_derived_metrics")
+    print(f"  - {CATALOG_NAME}.{SCHEMA_NAME}.mstr_derived_attributes")
+    print(f"  - {CATALOG_NAME}.{SCHEMA_NAME}.mstr_all_objects")
+    print(f"  - {CATALOG_NAME}.{SCHEMA_NAME}.mstr_datasets")
+    print(f"  - {CATALOG_NAME}.{SCHEMA_NAME}.mstr_dossiers_summary")
+print("="*80)
