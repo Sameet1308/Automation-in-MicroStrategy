@@ -5,7 +5,7 @@
 
 
 # ============================================================================
-# CELL 2: MICROSTRATEGY DOSSIER EXTRACTOR - FINAL VERSION
+# CELL 2: MICROSTRATEGY EXTRACTOR - COMPLETE VERSION WITH VISUALIZATION-LEVEL OBJECTS
 # ============================================================================
 
 import requests
@@ -15,6 +15,7 @@ import warnings
 from typing import Optional, Dict, List
 from datetime import datetime
 import os
+import json
 
 # Disable warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -31,11 +32,11 @@ PASSWORD = "your-password"                                  # CHANGE THIS
 PROJECT_ID = "your-project-id"                             # CHANGE THIS - REQUIRED
 
 # Dossier Selection (OPTIONAL)
-DOSSIER_ID = None  # Leave as None to extract ALL dossiers, or provide specific dossier ID like "ABC123DEF456"
+DOSSIER_ID = None  # Leave as None to extract ALL dossiers, or provide specific dossier ID
 
 # CSV Output Settings
 CSV_OUTPUT_PATH = "/dbfs/FileStore/mstr_extraction"       # Output path
-CSV_FILENAME = "dossier_derived_objects_mapping"          # Output filename
+CSV_FILENAME = "dossier_derived_objects_complete"         # Output filename
 
 # ============================================================================
 # EXTRACTOR CLASS
@@ -86,7 +87,7 @@ class MicroStrategyExtractor:
             return []
     
     def get_dossier_definition(self, dossier_id: str) -> Optional[Dict]:
-        """Get dossier definition"""
+        """Get complete dossier definition"""
         try:
             response = self.session.get(
                 f"{self.library_url}/api/v2/dossiers/{dossier_id}/definition",
@@ -102,7 +103,7 @@ class MicroStrategyExtractor:
             return None
     
     def extract_single_dossier(self, dossier_id: str, dossier_name: str = None) -> List[Dict]:
-        """Extract records from a single dossier"""
+        """Extract all derived objects from a single dossier"""
         
         if not dossier_name:
             dossier_name = dossier_id
@@ -115,8 +116,12 @@ class MicroStrategyExtractor:
             print(f"  ✗ Failed to get definition")
             return []
         
-        records = self._extract_records(dossier_id, definition.get('name', dossier_name), definition)
-        print(f"  ✓ Extracted {len(records)} derived objects")
+        # Extract from both datasets AND visualizations
+        records = []
+        records.extend(self._extract_from_datasets(dossier_id, definition.get('name', dossier_name), definition))
+        records.extend(self._extract_from_visualizations(dossier_id, definition.get('name', dossier_name), definition))
+        
+        print(f"  ✓ Extracted {len(records)} total objects")
         
         return records
     
@@ -139,8 +144,8 @@ class MicroStrategyExtractor:
         
         return all_records
     
-    def _extract_records(self, dossier_id: str, dossier_name: str, definition: Dict) -> List[Dict]:
-        """Extract records from dossier definition"""
+    def _extract_from_datasets(self, dossier_id: str, dossier_name: str, definition: Dict) -> List[Dict]:
+        """Extract objects from datasets (cube-level objects)"""
         
         records = []
         datasets = definition.get('datasets', [])
@@ -162,9 +167,13 @@ class MicroStrategyExtractor:
                 record = {
                     'dossier_id': dossier_id,
                     'dossier_name': dossier_name,
+                    'source_type': 'dataset',  # NEW: identifies source
+                    'source_location': f"Dataset: {dataset_name}",
                     'dataset_id': dataset_id,
                     'dataset_name': dataset_name,
                     'dataset_type': dataset_type,
+                    'chapter_name': None,
+                    'visualization_name': None,
                     'object_id': obj.get('id', ''),
                     'object_name': obj.get('name', ''),
                     'object_type': obj_type,
@@ -186,6 +195,110 @@ class MicroStrategyExtractor:
         
         return records
     
+    def _extract_from_visualizations(self, dossier_id: str, dossier_name: str, definition: Dict) -> List[Dict]:
+        """Extract dashboard-level derived objects from visualizations"""
+        
+        records = []
+        chapters = definition.get('chapters', [])
+        
+        for chapter in chapters:
+            chapter_key = chapter.get('key', '')
+            chapter_name = chapter.get('name', 'Unknown Chapter')
+            
+            pages = chapter.get('pages', [])
+            
+            for page in pages:
+                visualizations = page.get('visualizations', [])
+                
+                for viz in visualizations:
+                    viz_key = viz.get('key', '')
+                    viz_name = viz.get('name', 'Unknown Visualization')
+                    
+                    # Check for derived metrics and attributes in visualization
+                    derived_metrics = viz.get('metrics', [])
+                    derived_attributes = viz.get('attributes', [])
+                    
+                    # Process derived metrics
+                    for metric in derived_metrics:
+                        metric_id = metric.get('id', '')
+                        metric_name = metric.get('name', '')
+                        
+                        # Skip if this metric is from a dataset (not dashboard-derived)
+                        if self._is_from_dataset(metric_id, definition):
+                            continue
+                        
+                        record = {
+                            'dossier_id': dossier_id,
+                            'dossier_name': dossier_name,
+                            'source_type': 'visualization',  # Dashboard-level
+                            'source_location': f"Chapter: {chapter_name} > Viz: {viz_name}",
+                            'dataset_id': None,
+                            'dataset_name': None,
+                            'dataset_type': None,
+                            'chapter_name': chapter_name,
+                            'visualization_name': viz_name,
+                            'object_id': metric_id,
+                            'object_name': metric_name,
+                            'object_type': 'metric',
+                            'object_subtype': 'dashboard_derived',
+                            'object_description': metric.get('description', ''),
+                            'forms_count': None,
+                            'form_names': None,
+                            'extraction_timestamp': datetime.now().isoformat()
+                        }
+                        
+                        records.append(record)
+                    
+                    # Process derived attributes
+                    for attr in derived_attributes:
+                        attr_id = attr.get('id', '')
+                        attr_name = attr.get('name', '')
+                        
+                        # Skip if this attribute is from a dataset
+                        if self._is_from_dataset(attr_id, definition):
+                            continue
+                        
+                        record = {
+                            'dossier_id': dossier_id,
+                            'dossier_name': dossier_name,
+                            'source_type': 'visualization',  # Dashboard-level
+                            'source_location': f"Chapter: {chapter_name} > Viz: {viz_name}",
+                            'dataset_id': None,
+                            'dataset_name': None,
+                            'dataset_type': None,
+                            'chapter_name': chapter_name,
+                            'visualization_name': viz_name,
+                            'object_id': attr_id,
+                            'object_name': attr_name,
+                            'object_type': 'attribute',
+                            'object_subtype': 'dashboard_derived',
+                            'object_description': attr.get('description', ''),
+                            'forms_count': None,
+                            'form_names': None,
+                            'extraction_timestamp': datetime.now().isoformat()
+                        }
+                        
+                        forms = attr.get('forms', [])
+                        if forms:
+                            record['forms_count'] = len(forms)
+                            record['form_names'] = ', '.join([f.get('name', '') for f in forms])
+                        
+                        records.append(record)
+        
+        return records
+    
+    def _is_from_dataset(self, object_id: str, definition: Dict) -> bool:
+        """Check if an object ID exists in datasets (to avoid duplicates)"""
+        datasets = definition.get('datasets', [])
+        
+        for dataset in datasets:
+            objects = dataset.get('availableObjects', [])
+            for obj in objects:
+                if obj.get('id') == object_id:
+                    return True
+        
+        return False
+    
     def logout(self):
         """Logout and cleanup"""
         try:
@@ -204,7 +317,7 @@ class MicroStrategyExtractor:
 # ============================================================================
 
 print("="*80)
-print("MICROSTRATEGY DOSSIER DERIVED OBJECTS EXTRACTOR")
+print("MICROSTRATEGY DOSSIER EXTRACTOR - COMPLETE (DATASET + DASHBOARD OBJECTS)")
 print("="*80)
 
 # Validate required parameters
@@ -263,9 +376,13 @@ try:
     columns = [
         'dossier_id',
         'dossier_name',
+        'source_type',
+        'source_location',
         'dataset_id',
         'dataset_name',
         'dataset_type',
+        'chapter_name',
+        'visualization_name',
         'object_id',
         'object_name',
         'object_type',
@@ -282,9 +399,10 @@ try:
     print(f"\n📈 Statistics:")
     print(f"  Total Records: {len(df)}")
     print(f"  Unique Dossiers: {df['dossier_name'].nunique()}")
-    print(f"  Unique Datasets/Cubes: {df['dataset_name'].nunique()}")
-    print(f"  Derived Metrics: {len(df[df['object_type'] == 'metric'])}")
-    print(f"  Derived Attributes: {len(df[df['object_type'] == 'attribute'])}")
+    print(f"  Dataset-Level Objects: {len(df[df['source_type'] == 'dataset'])}")
+    print(f"  Dashboard-Level Objects: {len(df[df['source_type'] == 'visualization'])}")
+    print(f"  Total Metrics: {len(df[df['object_type'] == 'metric'])}")
+    print(f"  Total Attributes: {len(df[df['object_type'] == 'attribute'])}")
     
     # Step 6: Export to CSV
     print("\n" + "="*80)
@@ -307,30 +425,16 @@ try:
     print("📊 SAMPLE DATA (First 10 rows)")
     print("="*80)
     
-    sample_cols = ['dossier_name', 'dataset_name', 'object_name', 'object_type', 'object_subtype']
+    sample_cols = ['dossier_name', 'source_type', 'object_name', 'object_type', 'source_location']
     print("\n" + df[sample_cols].head(10).to_string(index=False))
     
-    # Step 8: Summary by dossier
+    # Step 8: Summary by source type
     print("\n" + "="*80)
-    print("📋 SUMMARY BY DOSSIER")
+    print("📋 SUMMARY BY SOURCE TYPE")
     print("="*80)
     
-    summary = df.groupby('dossier_name').agg({
-        'dataset_name': lambda x: x.nunique(),
-        'object_id': 'count'
-    }).rename(columns={
-        'dataset_name': 'unique_datasets',
-        'object_id': 'total_objects'
-    })
-    
-    metrics_count = df[df['object_type'] == 'metric'].groupby('dossier_name').size()
-    attrs_count = df[df['object_type'] == 'attribute'].groupby('dossier_name').size()
-    
-    summary['metrics'] = metrics_count
-    summary['attributes'] = attrs_count
-    summary = summary.fillna(0).astype({'metrics': int, 'attributes': int})
-    
-    print("\n" + summary.to_string())
+    summary = df.groupby(['dossier_name', 'source_type']).size().reset_index(name='count')
+    print("\n" + summary.to_string(index=False))
     
     # Final message
     print("\n" + "="*80)
@@ -343,19 +447,13 @@ try:
     print(f"   2. Click: Data → FileStore")
     print(f"   3. Navigate to: {CSV_OUTPUT_PATH.replace('/dbfs/FileStore/', '')}")
     print(f"   4. Click on the file to download")
-    print("\n✨ Extraction completed successfully - NO ERRORS!")
+    print("\n✨ Now includes BOTH dataset-level AND dashboard-level derived objects!")
 
 except Exception as e:
     print("\n" + "="*80)
     print("❌ ERROR OCCURRED")
     print("="*80)
     print(f"\nError: {str(e)}")
-    print("\nPlease check:")
-    print("  1. LIBRARY_URL is correct")
-    print("  2. USERNAME and PASSWORD are correct")
-    print("  3. PROJECT_ID is correct")
-    print("  4. DOSSIER_ID is correct (if provided)")
-    print("  5. You have access to the project/dossier")
     import traceback
     traceback.print_exc()
     raise
