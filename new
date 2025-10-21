@@ -1,5 +1,5 @@
 # ============================================================================
-# DIAGNOSTIC SCRIPT - SEE WHAT THE API ACTUALLY RETURNS
+# GET COMPLETE DOSSIER DEFINITION JSON
 # ============================================================================
 
 import requests
@@ -18,93 +18,114 @@ LIBRARY_URL = "https://your-server/MicroStrategyLibrary"  # CHANGE THIS
 USERNAME = "your-username"                                  # CHANGE THIS
 PASSWORD = "your-password"                                  # CHANGE THIS
 PROJECT_ID = "your-project-id"                             # CHANGE THIS
-DOSSIER_ID = "your-dossier-id"                            # CHANGE THIS - Use a dossier with dashboard-level derived metrics
+DOSSIER_ID = "your-dossier-id"                            # CHANGE THIS
+
+# Output file location
+OUTPUT_FILE = "/dbfs/FileStore/dossier_definition_complete.json"
 
 # ============================================================================
-# GET THE RAW DEFINITION
+# FETCH COMPLETE DEFINITION
 # ============================================================================
 
 print("="*80)
-print("DOSSIER DEFINITION DIAGNOSTIC")
+print("FETCHING COMPLETE DOSSIER DEFINITION")
 print("="*80)
 
 session = requests.Session()
 session.verify = False
 
 try:
-    # Authenticate
-    print("\n1. Authenticating...")
+    # Step 1: Authenticate
+    print(f"\n1. Authenticating as {USERNAME}...")
     auth_response = session.post(
-        f"{LIBRARY_URL}/api/auth/login",
+        f"{LIBRARY_URL.rstrip('/')}/api/auth/login",
         json={"username": USERNAME, "password": PASSWORD},
         headers={"Content-Type": "application/json"}
     )
     auth_response.raise_for_status()
     auth_token = auth_response.headers.get('X-MSTR-AuthToken')
-    print("✓ Authenticated")
+    print("   ✓ Authenticated")
     
-    # Get dossier definition
-    print(f"\n2. Fetching dossier definition for: {DOSSIER_ID}")
+    # Step 2: Get dossier definition
+    print(f"\n2. Fetching dossier definition...")
+    print(f"   Dossier ID: {DOSSIER_ID}")
+    print(f"   Project ID: {PROJECT_ID}")
+    
     definition_response = session.get(
-        f"{LIBRARY_URL}/api/v2/dossiers/{DOSSIER_ID}/definition",
+        f"{LIBRARY_URL.rstrip('/')}/api/v2/dossiers/{DOSSIER_ID}/definition",
         headers={
             "X-MSTR-AuthToken": auth_token,
-            "X-MSTR-ProjectId": PROJECT_ID
+            "X-MSTR-ProjectId": PROJECT_ID,
+            "Accept": "application/json"
         }
     )
     definition_response.raise_for_status()
+    
+    # Get the complete JSON
     definition = definition_response.json()
-    print("✓ Definition retrieved")
+    print("   ✓ Definition retrieved")
     
-    # Save to file
-    with open('/dbfs/FileStore/dossier_definition_raw.json', 'w') as f:
-        json.dump(definition, f, indent=2)
-    print("\n✓ Saved to: /dbfs/FileStore/dossier_definition_raw.json")
+    # Step 3: Save complete JSON to file
+    print(f"\n3. Saving complete JSON to file...")
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(definition, f, indent=2, ensure_ascii=False)
     
-    # Show structure
+    print(f"   ✓ Saved to: {OUTPUT_FILE}")
+    
+    # Step 4: Display complete JSON
     print("\n" + "="*80)
-    print("DOSSIER DEFINITION STRUCTURE")
+    print("COMPLETE JSON DEFINITION")
+    print("="*80)
+    print("\n")
+    
+    # Print the entire JSON with pretty formatting
+    complete_json = json.dumps(definition, indent=2, ensure_ascii=False)
+    print(complete_json)
+    
+    # Step 5: Summary
+    print("\n" + "="*80)
+    print("SUMMARY")
     print("="*80)
     
-    print(f"\nTop-level keys:")
+    total_chars = len(complete_json)
+    total_lines = len(complete_json.split('\n'))
+    
+    print(f"\nTotal Characters: {total_chars:,}")
+    print(f"Total Lines: {total_lines:,}")
+    print(f"\nFile saved to: {OUTPUT_FILE}")
+    print(f"File size: {len(complete_json)} bytes")
+    
+    # Top-level structure
+    print(f"\nTop-level keys in definition:")
     for key in definition.keys():
-        print(f"  • {key}")
+        if isinstance(definition[key], list):
+            print(f"  • {key} (array, {len(definition[key])} items)")
+        elif isinstance(definition[key], dict):
+            print(f"  • {key} (object, {len(definition[key])} keys)")
+        else:
+            print(f"  • {key}: {definition[key]}")
     
-    print(f"\n\nDatasets:")
-    if 'datasets' in definition:
-        datasets = definition['datasets']
-        print(f"  Count: {len(datasets)}")
-        if datasets:
-            print(f"  First dataset keys: {list(datasets[0].keys())}")
-            if 'availableObjects' in datasets[0]:
-                print(f"  Objects in first dataset: {len(datasets[0]['availableObjects'])}")
-    
-    print(f"\n\nChapters:")
-    if 'chapters' in definition:
-        chapters = definition['chapters']
-        print(f"  Count: {len(chapters)}")
-        if chapters:
-            print(f"  First chapter keys: {list(chapters[0].keys())}")
-            if 'pages' in chapters[0] and chapters[0]['pages']:
-                print(f"  Pages in first chapter: {len(chapters[0]['pages'])}")
-                if 'visualizations' in chapters[0]['pages'][0]:
-                    vizs = chapters[0]['pages'][0]['visualizations']
-                    print(f"  Visualizations in first page: {len(vizs)}")
-                    if vizs:
-                        print(f"  First visualization keys: {list(vizs[0].keys())}")
-    else:
-        print("  ⚠️ NO 'chapters' key found in definition!")
+    # Logout
+    session.post(
+        f"{LIBRARY_URL.rstrip('/')}/api/auth/logout",
+        headers={"X-MSTR-AuthToken": auth_token},
+        timeout=5
+    )
     
     print("\n" + "="*80)
-    print("SAMPLE DEFINITION (First 100 lines)")
+    print("COMPLETE!")
     print("="*80)
-    
-    definition_str = json.dumps(definition, indent=2)
-    lines = definition_str.split('\n')[:100]
-    print('\n'.join(lines))
-    
-    print("\n\n💡 Full JSON saved to: /dbfs/FileStore/dossier_definition_raw.json")
-    print("   Download it from Databricks to see complete structure")
+    print(f"\n💾 Download the JSON file from:")
+    print(f"   Databricks UI → Data → FileStore → dossier_definition_complete.json")
+
+except requests.exceptions.HTTPError as e:
+    print(f"\n✗ HTTP Error: {e}")
+    print(f"   Status Code: {e.response.status_code}")
+    try:
+        error_detail = e.response.json()
+        print(f"   Error Detail: {json.dumps(error_detail, indent=2)}")
+    except:
+        print(f"   Response: {e.response.text}")
 
 except Exception as e:
     print(f"\n✗ Error: {e}")
