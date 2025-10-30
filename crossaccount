@@ -1,0 +1,289 @@
+Cross‑Account S3 Copy with KMS Encryption
+
+This document explains how to set up two S3 buckets in different AWS accounts—one owned by a vendor (the source account) and one owned by the CloudML team (the destination account)—so that when a new object is uploaded to the vendor’s bucket, a Lambda function in the CloudML account copies the object to the destination bucket and re‑encrypts it with a different KMS key.
+
+The guide is divided into two parts: a high‑level commentary that describes the order of operations, and a detailed section with AWS CLI commands, IAM policies and sample code.
+
+Commentary – Step‑by‑Step Overview
+
+Vendor creates their resources first. In the source account, the vendor creates a new S3 bucket and a customer‑managed KMS key. They enable default server‑side encryption on the bucket using the new key. These are the foundational resources for storing encrypted data.
+
+Vendor shares resource details with CloudML. The vendor provides the CloudML team with the bucket name/ARN and the KMS key ARN. CloudML needs these identifiers to grant its Lambda function permission to read and decrypt the vendor’s objects.
+
+CloudML sets up its own infrastructure. The CloudML team creates a destination bucket, also encrypted with a customer‑managed KMS key. They define an IAM role for a Lambda function, granting it permission to read from the vendor’s bucket, write to the destination bucket, and use both KMS keys. They then deploy a Lambda function that copies objects from the vendor’s bucket to their bucket and re‑encrypts them.
+
+CloudML shares its role and function ARNs. To configure cross‑account access, the vendor needs the ARN of CloudML’s IAM role and the Lambda function. The vendor uses these ARNs to update their bucket and KMS policies and to configure the event notification.
+
+Vendor updates their policies. The vendor adds a resource‑based policy to their bucket granting CloudML’s role s3:GetObject and s3:ListBucket, and they modify their KMS key policy to allow CloudML’s role to decrypt objects. These changes prevent “Access Denied” errors when CloudML’s Lambda tries to read data.
+
+Vendor configures the S3 Event Notification. Using the ARN of the CloudML Lambda, the vendor creates a notification configuration that triggers on s3:ObjectCreated events and invokes CloudML’s Lambda function. This links object uploads in the source bucket to the copy operation.
+
+CloudML finalizes Lambda invocation permissions. CloudML uses aws lambda add-permission to add a resource‑based policy allowing Amazon S3 in the vendor’s account to invoke the Lambda function. With this permission in place, the cross‑account invocation completes successfully.
+
+After these steps, uploading a file to the vendor’s bucket generates an S3 event, triggers the Lambda function in the CloudML account, and copies the file to the destination bucket with the correct encryption.
+
+Detailed Implementation
+1. Vendor: Create the source bucket and KMS key
+# Create the source bucket (replace with actual bucket name)
+aws s3api create-bucket \
+  --bucket source-bucket \
+  --region us-east-1 \
+  --create-bucket-configuration LocationConstraint=us-east-1
+
+# Create the vendor KMS key
+aws kms create-key \
+  --description "Key for source bucket encryption" \
+  --region us-east-1
+# Note the key ARN (e.g., arn:aws:kms:us-east-1:<vendor-account-id>:key/source-key-id)
+
+# Enable default encryption on the source bucket
+aws s3api put-bucket-encryption \
+  --bucket source-bucket \
+  --server-side-encryption-configuration '{
+    "Rules": [
+      {
+        "ApplyServerSideEncryptionByDefault": {
+          "SSEAlgorithm": "aws:kms",
+          "KMSMasterKeyID": "arn:aws:kms:us-east-1:<vendor-account-id>:key/source-key-id"
+        }
+      }
+    ]
+  }'
+
+2. CloudML: Create the destination bucket, KMS key and IAM role
+# Create the destination bucket (replace with actual name)
+aws s3api create-bucket \
+  --bucket destination-bucket \
+  --region us-east-1 \
+  --create-bucket-configuration LocationConstraint=us-east-1
+
+# Create the destination KMS key
+aws kms create-key \
+  --description "Key for destination bucket encryption" \
+  --region us-east-1
+# Note the key ARN (e.g., arn:aws:kms:us-east-1:<dest-account-id>:key/destination-key-id)
+
+# Enable default encryption on the destination bucket
+aws s3api put-bucket-encryption \
+  --bucket destination-bucket \
+  --server-side-encryption-configuration '{
+    "Rules": [
+      {
+        "ApplyServerSideEncryptionByDefault": {
+          "SSEAlgorithm": "aws:kms",
+          "KMSMasterKeyID": "arn:aws:kms:us-east-1:<dest-account-id>:key/destination-key-id"
+        }
+      }
+    ]
+  }'
+
+# Create the IAM role for Lambda
+aws iam create-role \
+  --role-name S3CopyLambdaRole \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"},
+        "Action": "sts:AssumeRole"
+      }
+    ]
+  }'
+
+# Attach the basic execution role for logging
+aws iam attach-role-policy \
+  --role-name S3CopyLambdaRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Create an inline policy granting read, write and KMS permissions (fill in actual ARNs)
+cat > s3copy-inline-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadFromSourceBucket",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::<source-bucket>",
+        "arn:aws:s3:::<source-bucket>/*"
+      ]
+    },
+    {
+      "Sid": "WriteToDestinationBucket",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::destination-bucket/*"]
+    },
+    {
+      "Sid": "DecryptSourceData",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": ["arn:aws:kms:us-east-1:<vendor-account-id>:key/<source-key-id>"]
+    },
+    {
+      "Sid": "EncryptAndDecryptDestinationData",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ],
+      "Resource": ["arn:aws:kms:us-east-1:<dest-account-id>:key/destination-key-id"]
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy \
+  --role-name S3CopyLambdaRole \
+  --policy-name S3CopyInlinePolicy \
+  --policy-document file://s3copy-inline-policy.json
+
+3. CloudML: Deploy the Lambda function
+
+Create a Python file (lambda_function.py) with the copy logic:
+
+import boto3, os
+
+s3 = boto3.client('s3')
+DEST_BUCKET = os.environ['DEST_BUCKET']
+DEST_KMS_KEY = os.environ['DEST_KMS_KEY']
+
+def lambda_handler(event, context):
+    for record in event['Records']:
+        src_bucket = record['s3']['bucket']['name']
+        src_key = record['s3']['object']['key']
+        s3.copy_object(
+            Bucket=DEST_BUCKET,
+            Key=src_key,
+            CopySource={'Bucket': src_bucket, 'Key': src_key},
+            ServerSideEncryption='aws:kms',
+            SSEKMSKeyId=DEST_KMS_KEY,
+            ACL='bucket-owner-full-control'
+        )
+
+
+Package and deploy the function:
+
+zip function.zip lambda_function.py
+
+aws lambda create-function \
+  --function-name S3CopyFunction \
+  --runtime python3.11 \
+  --role arn:aws:iam::<dest-account-id>:role/S3CopyLambdaRole \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://function.zip \
+  --region us-east-1 \
+  --environment Variables="{DEST_BUCKET=destination-bucket,DEST_KMS_KEY=arn:aws:kms:us-east-1:<dest-account-id>:key/destination-key-id}"
+
+4. Vendor: Update bucket and KMS policies
+
+Bucket policy (grant read/list to CloudML role):
+
+{
+  "Version": "2008-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<dest-account-id>:role/S3CopyLambdaRole"
+      },
+      "Action": [ "s3:GetObject", "s3:ListBucket" ],
+      "Resource": [
+        "arn:aws:s3:::source-bucket",
+        "arn:aws:s3:::source-bucket/*"
+      ]
+    }
+  ]
+}
+
+
+Apply it:
+
+aws s3api put-bucket-policy \
+  --bucket source-bucket \
+  --policy file://source-bucket-policy.json
+
+
+KMS key policy (allow CloudML role to decrypt):
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnableVendorRootAccess",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<vendor-account-id>:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowCrossAccountDecrypt",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<dest-account-id>:role/S3CopyLambdaRole" },
+      "Action": "kms:Decrypt",
+      "Resource": "*"
+    }
+  ]
+}
+
+
+Apply it:
+
+aws kms put-key-policy \
+  --key-id arn:aws:kms:us-east-1:<vendor-account-id>:key/source-key-id \
+  --policy-name default \
+  --policy file://update-source-key-policy.json
+
+5. Vendor: Configure the S3 Event Notification
+
+Create a notification.json that references the CloudML Lambda ARN:
+
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "Id": "InvokeCloudMLCopyFunction",
+      "LambdaFunctionArn": "arn:aws:lambda:us-east-1:<dest-account-id>:function:S3CopyFunction",
+      "Events": ["s3:ObjectCreated:*"]
+    }
+  ]
+}
+
+
+Apply it:
+
+aws s3api put-bucket-notification-configuration \
+  --bucket source-bucket \
+  --notification-configuration file://notification.json
+
+6. CloudML: Allow S3 to invoke the Lambda
+aws lambda add-permission \
+  --function-name S3CopyFunction \
+  --statement-id AllowVendorInvoke \
+  --principal s3.amazonaws.com \
+  --action lambda:InvokeFunction \
+  --source-arn arn:aws:s3:::source-bucket \
+  --source-account <vendor-account-id>
+
+7. Testing
+
+The vendor uploads a test file to source-bucket:
+
+aws s3 cp test.txt s3://source-bucket/test.txt
+
+
+CloudML checks CloudWatch logs for the Lambda function to confirm it was invoked.
+
+Verify that test.txt appears in destination-bucket and is encrypted with the destination KMS key.
+
+Notes
+
+Replace all placeholder values (<vendor-account-id>, <dest-account-id>, bucket names and key IDs) with your real values.
+
+Both buckets and the Lambda function must reside in the same AWS Region for S3 event notifications to work.
+
+The IAM policies shown here grant only the permissions necessary for the copy operation. You can further scope them with conditions if required.
