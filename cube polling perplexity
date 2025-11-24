@@ -1,0 +1,689 @@
+<#
+.SYNOPSIS
+    MicroStrategy Cube Refresh with Polling and Retry Logic
+
+.DESCRIPTION
+    This script triggers a cube refresh in MicroStrategy using REST API v2,
+    polls the cube status every 5 seconds, and implements retry logic with
+    a 45-minute timeout threshold.
+    
+    **SECURITY NOTE**: This script contains hardcoded credentials and disables SSL verification.
+    This is suitable for testing/development environments only.
+    For production, use secure credential management (e.g., Azure Key Vault, CyberArk).
+
+.PARAMETER LibraryUrl
+    Base URL of MicroStrategy Library (e.g., https://your-server.com/MicroStrategyLibrary)
+
+.PARAMETER CubeId
+    The GUID of the cube to refresh
+
+.PARAMETER ProjectId
+    MicroStrategy Project ID (optional, will prompt to select if not provided)
+
+.PARAMETER MaxRetries
+    Maximum number of retry attempts (default=3)
+
+.PARAMETER PollingIntervalSeconds
+    Interval between status checks in seconds (default=5)
+
+.PARAMETER TimeoutMinutes
+    Timeout threshold for retry decision in minutes (default=45)
+
+.EXAMPLE
+    .\Refresh-MSTRCube.ps1 -LibraryUrl "https://demo.microstrategy.com/MicroStrategyLibrary" `
+                           -CubeId "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6" `
+                           -ProjectId "B7CA92F04B9FAE8D941C3E9B7E0CD754"
+
+.EXAMPLE
+    # Quick test with just Library URL and Cube ID (will prompt for project)
+    .\Refresh-MSTRCube.ps1 -LibraryUrl "https://your-mstr-server/MicroStrategyLibrary" `
+                           -CubeId "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6"
+
+.NOTES
+    Author: Data Engineering Team
+    Date: November 2024
+    Version: 2.1
+    Uses MicroStrategy REST API v2 (2024)
+    
+    ⚠️ SECURITY WARNING ⚠️
+    - Admin credentials are hardcoded (lines 85-86)
+    - SSL certificate verification is DISABLED (line 113)
+    - Use ONLY in development/test environments
+    - Update credentials and enable SSL for production use
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$LibraryUrl,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$CubeId,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ProjectId,
+    
+    [Parameter(Mandatory=$false)]
+    [int]$MaxRetries = 3,
+    
+    [Parameter(Mandatory=$false)]
+    [int]$PollingIntervalSeconds = 5,
+    
+    [Parameter(Mandatory=$false)]
+    [int]$TimeoutMinutes = 45
+)
+
+#region Configuration
+
+# ⚠️ HARDCODED CREDENTIALS - FOR DEVELOPMENT/TEST ONLY ⚠️
+# TODO: Move to secure credential management for production
+$ADMIN_USERNAME = "administrator"  # ← CHANGE THIS to your admin username
+$ADMIN_PASSWORD = "YourPassword123"  # ← CHANGE THIS to your admin password
+$LOGIN_MODE = 1  # 1=Standard, 16=LDAP
+
+# Global variables
+$script:AuthToken = $null
+$script:Cookies = $null
+$script:BaseUrl = $LibraryUrl.TrimEnd('/')
+
+# Cube status enum (from MicroStrategy API documentation)
+$CubeStatus = @{
+    0 = 'Unpublished'
+    1 = 'Publishing'
+    2 = 'Published'
+    4 = 'Loaded'
+    8 = 'Processing'
+    16 = 'Imported'
+    32 = 'Dirty'
+    64 = 'Ready'
+    128 = 'Loading'
+    256 = 'Executing'
+    512 = 'Persisting'
+    1024 = 'Persisted'
+    2048 = 'Reserved'
+    4096 = 'ProcessingWarning'
+    8192 = 'Unloading'
+    16384 = 'ExecutionFailed'
+    17510 = 'Published_Ready'  # Combined status (Published + Loaded + Ready)
+}
+
+#endregion
+
+#region SSL and TLS Configuration
+
+# ⚠️ DISABLE SSL CERTIFICATE VALIDATION - FOR DEVELOPMENT/TEST ONLY ⚠️
+# This bypasses SSL certificate errors (self-signed, expired, hostname mismatch)
+# TODO: Remove this for production and use valid SSL certificates
+Write-Host "⚠️  WARNING: SSL Certificate Validation is DISABLED" -ForegroundColor Yellow
+Write-Host "   This is insecure and should only be used in development/test environments" -ForegroundColor Yellow
+Write-Host ""
+
+# Set TLS version to 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Disable SSL certificate validation
+Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint srvPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) {
+            return true;
+        }
+    }
+"@
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+
+#endregion
+
+#region Helper Functions
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('Info','Success','Warning','Error')]
+        [string]$Level = 'Info'
+    )
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $color = switch($Level) {
+        'Info'    { 'Cyan' }
+        'Success' { 'Green' }
+        'Warning' { 'Yellow' }
+        'Error'   { 'Red' }
+    }
+    
+    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
+    
+    # Also log to file
+    $logFile = "MSTRCubeRefresh_$(Get-Date -Format 'yyyyMMdd').log"
+    "$timestamp [$Level] $Message" | Out-File -FilePath $logFile -Append
+}
+
+#endregion
+
+#region Authentication Functions
+
+function Connect-MicroStrategy {
+    <#
+    .SYNOPSIS
+        Authenticates with MicroStrategy REST API and returns auth token
+    #>
+    
+    Write-Log "Authenticating with MicroStrategy as '$ADMIN_USERNAME'..." -Level Info
+    
+    $uri = "$script:BaseUrl/api/auth/login"
+    
+    $body = @{
+        username = $ADMIN_USERNAME
+        password = $ADMIN_PASSWORD
+        loginMode = $LOGIN_MODE
+        applicationType = 35  # REST API application type
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method Post -Body $body -ContentType "application/json" -SessionVariable webSession
+        
+        if ($response.StatusCode -eq 204) {
+            $script:AuthToken = $response.Headers['X-MSTR-AuthToken']
+            $script:Cookies = $webSession
+            
+            Write-Log "Authentication successful. Token: $($script:AuthToken.Substring(0,10))..." -Level Success
+            return $true
+        }
+    }
+    catch {
+        Write-Log "Authentication failed: $($_.Exception.Message)" -Level Error
+        
+        # Try to extract detailed error
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $responseBody = $reader.ReadToEnd()
+                Write-Log "API Response: $responseBody" -Level Error
+            }
+            catch {
+                # Ignore if can't read response
+            }
+        }
+        
+        return $false
+    }
+}
+
+function Get-MicroStrategyProjects {
+    <#
+    .SYNOPSIS
+        Retrieves available projects
+    #>
+    
+    Write-Log "Retrieving available projects..." -Level Info
+    
+    $uri = "$script:BaseUrl/api/projects"
+    $headers = @{
+        'X-MSTR-AuthToken' = $script:AuthToken
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -WebSession $script:Cookies
+        
+        Write-Log "Found $($response.Count) projects" -Level Success
+        
+        # Display projects
+        Write-Host ""
+        $i = 1
+        foreach ($project in $response) {
+            Write-Host "  $i. $($project.name) (ID: $($project.id))" -ForegroundColor White
+            $i++
+        }
+        Write-Host ""
+        
+        return $response
+    }
+    catch {
+        Write-Log "Failed to retrieve projects: $($_.Exception.Message)" -Level Error
+        return $null
+    }
+}
+
+function Disconnect-MicroStrategy {
+    <#
+    .SYNOPSIS
+        Logs out and terminates the session
+    #>
+    
+    Write-Log "Logging out from MicroStrategy..." -Level Info
+    
+    $uri = "$script:BaseUrl/api/auth/logout"
+    $headers = @{
+        'X-MSTR-AuthToken' = $script:AuthToken
+    }
+    
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -WebSession $script:Cookies
+        if ($response.StatusCode -eq 204) {
+            Write-Log "Logout successful" -Level Success
+        }
+    }
+    catch {
+        Write-Log "Logout failed: $($_.Exception.Message)" -Level Warning
+    }
+}
+
+#endregion
+
+#region Cube Operations
+
+function Get-CubeStatus {
+    <#
+    .SYNOPSIS
+        Gets the current status of a cube
+    #>
+    param(
+        [string]$CubeId,
+        [string]$ProjectId
+    )
+    
+    $uri = "$script:BaseUrl/api/monitors/caches/cubes?id=$CubeId"
+    $headers = @{
+        'X-MSTR-AuthToken' = $script:AuthToken
+        'X-MSTR-ProjectID' = $ProjectId
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -WebSession $script:Cookies
+        
+        if ($response.cubesInfos -and $response.cubesInfos.Count -gt 0) {
+            $cubeInfo = $response.cubesInfos[0]
+            return @{
+                Success = $true
+                StatusCode = $cubeInfo.status
+                StatusName = $CubeStatus[[int]$cubeInfo.status]
+                Size = $cubeInfo.size
+                HitCount = $cubeInfo.hitCount
+                LastUpdate = $cubeInfo.lastUpdateTime
+                ErrorMessage = $null
+            }
+        }
+        else {
+            return @{
+                Success = $false
+                ErrorMessage = "Cube not found in monitor"
+            }
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            ErrorMessage = $_.Exception.Message
+        }
+    }
+}
+
+function Start-CubeRefresh {
+    <#
+    .SYNOPSIS
+        Triggers cube refresh/republish operation
+    #>
+    param(
+        [string]$CubeId,
+        [string]$ProjectId
+    )
+    
+    Write-Log "Triggering cube refresh for Cube ID: $CubeId" -Level Info
+    
+    # Using the cube publish/refresh endpoint
+    $uri = "$script:BaseUrl/api/cubes/$CubeId"
+    $headers = @{
+        'X-MSTR-AuthToken' = $script:AuthToken
+        'X-MSTR-ProjectID' = $ProjectId
+        'Content-Type' = 'application/json'
+    }
+    
+    try {
+        $startTime = Get-Date
+        $response = Invoke-WebRequest -Uri $uri -Method Post -Headers $headers -WebSession $script:Cookies
+        
+        if ($response.StatusCode -eq 200 -or $response.StatusCode -eq 202) {
+            Write-Log "Cube refresh triggered successfully" -Level Success
+            return @{
+                Success = $true
+                StartTime = $startTime
+                ErrorMessage = $null
+            }
+        }
+        else {
+            return @{
+                Success = $false
+                StartTime = $startTime
+                ErrorMessage = "Unexpected status code: $($response.StatusCode)"
+            }
+        }
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        
+        # Try to extract more detailed error from response
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $responseBody = $reader.ReadToEnd()
+                
+                try {
+                    $errorObj = $responseBody | ConvertFrom-Json
+                    if ($errorObj.message) {
+                        $errorMessage = $errorObj.message
+                    }
+                }
+                catch {
+                    $errorMessage += " | Response: $responseBody"
+                }
+            }
+            catch {
+                # Ignore if can't read response
+            }
+        }
+        
+        Write-Log "Failed to trigger cube refresh: $errorMessage" -Level Error
+        return @{
+            Success = $false
+            StartTime = Get-Date
+            ErrorMessage = $errorMessage
+        }
+    }
+}
+
+function Wait-CubeRefreshComplete {
+    <#
+    .SYNOPSIS
+        Polls cube status until completion or failure
+    #>
+    param(
+        [string]$CubeId,
+        [string]$ProjectId,
+        [DateTime]$StartTime,
+        [int]$PollingIntervalSeconds = 5
+    )
+    
+    Write-Log "Starting status polling (interval: $PollingIntervalSeconds seconds)..." -Level Info
+    
+    $processingStatuses = @(1, 8, 128, 256, 512)  # Publishing, Processing, Loading, Executing, Persisting
+    $successStatuses = @(2, 64, 1024, 17510)  # Published, Ready, Persisted, Published_Ready
+    $failureStatuses = @(16384, 4096)  # ExecutionFailed, ProcessingWarning
+    
+    $consecutiveErrors = 0
+    $maxConsecutiveErrors = 3
+    
+    while ($true) {
+        Start-Sleep -Seconds $PollingIntervalSeconds
+        
+        $status = Get-CubeStatus -CubeId $CubeId -ProjectId $ProjectId
+        $elapsedTime = (Get-Date) - $StartTime
+        
+        if (-not $status.Success) {
+            $consecutiveErrors++
+            Write-Log "Error polling cube status: $($status.ErrorMessage) (Attempt $consecutiveErrors/$maxConsecutiveErrors)" -Level Warning
+            
+            if ($consecutiveErrors -ge $maxConsecutiveErrors) {
+                return @{
+                    Success = $false
+                    StatusCode = $null
+                    ElapsedTime = $elapsedTime
+                    ErrorMessage = "Failed to get cube status after $maxConsecutiveErrors attempts"
+                }
+            }
+            continue
+        }
+        
+        $consecutiveErrors = 0
+        $statusCode = $status.StatusCode
+        $statusName = $status.StatusName
+        
+        Write-Log "Cube status: $statusName ($statusCode) | Elapsed: $([math]::Round($elapsedTime.TotalMinutes, 2)) minutes" -Level Info
+        
+        # Check for success
+        if ($statusCode -in $successStatuses) {
+            Write-Log "Cube refresh completed successfully!" -Level Success
+            Write-Log "Final Status: $statusName | Size: $($status.Size) bytes | Last Update: $($status.LastUpdate)" -Level Success
+            return @{
+                Success = $true
+                StatusCode = $statusCode
+                StatusName = $statusName
+                ElapsedTime = $elapsedTime
+                ErrorMessage = $null
+            }
+        }
+        
+        # Check for failure
+        if ($statusCode -in $failureStatuses) {
+            Write-Log "Cube refresh failed with status: $statusName" -Level Error
+            return @{
+                Success = $false
+                StatusCode = $statusCode
+                StatusName = $statusName
+                ElapsedTime = $elapsedTime
+                ErrorMessage = "Cube refresh failed with status: $statusName"
+            }
+        }
+        
+        # Still processing - continue polling
+        if ($statusCode -in $processingStatuses) {
+            Write-Log "Cube is still processing... ($statusName)" -Level Info
+            continue
+        }
+        
+        # Unknown status - log and continue
+        Write-Log "Unexpected cube status: $statusName ($statusCode) - continuing to monitor" -Level Warning
+    }
+}
+
+#endregion
+
+#region Main Execution
+
+function Start-CubeRefreshWithRetry {
+    <#
+    .SYNOPSIS
+        Main function that implements retry logic with timeout threshold
+    #>
+    param(
+        [string]$CubeId,
+        [string]$ProjectId,
+        [int]$MaxRetries = 3,
+        [int]$PollingIntervalSeconds = 5,
+        [int]$TimeoutMinutes = 45
+    )
+    
+    Write-Log "=== Starting Cube Refresh Process ===" -Level Info
+    Write-Log "Cube ID: $CubeId" -Level Info
+    Write-Log "Project ID: $ProjectId" -Level Info
+    Write-Log "Max Retries: $MaxRetries" -Level Info
+    Write-Log "Timeout Threshold: $TimeoutMinutes minutes" -Level Info
+    Write-Log "======================================" -Level Info
+    
+    $attemptNumber = 1
+    
+    while ($attemptNumber -le $MaxRetries) {
+        Write-Log "" -Level Info
+        Write-Log "========== ATTEMPT $attemptNumber of $MaxRetries ==========" -Level Info
+        
+        # Trigger cube refresh
+        $refreshResult = Start-CubeRefresh -CubeId $CubeId -ProjectId $ProjectId
+        
+        if (-not $refreshResult.Success) {
+            Write-Log "Failed to trigger cube refresh on attempt $attemptNumber" -Level Error
+            Write-Log "Error: $($refreshResult.ErrorMessage)" -Level Error
+            
+            if ($attemptNumber -lt $MaxRetries) {
+                Write-Log "Waiting 30 seconds before retry..." -Level Warning
+                Start-Sleep -Seconds 30
+                $attemptNumber++
+                continue
+            }
+            else {
+                Write-Log "Max retries reached. Exiting." -Level Error
+                return @{
+                    Success = $false
+                    FinalAttempt = $attemptNumber
+                    ErrorMessage = "Failed to trigger cube refresh after $MaxRetries attempts"
+                }
+            }
+        }
+        
+        # Poll for completion
+        $pollResult = Wait-CubeRefreshComplete -CubeId $CubeId -ProjectId $ProjectId `
+                                                -StartTime $refreshResult.StartTime `
+                                                -PollingIntervalSeconds $PollingIntervalSeconds
+        
+        # Check result
+        if ($pollResult.Success) {
+            Write-Log "" -Level Success
+            Write-Log "========================================" -Level Success
+            Write-Log "CUBE REFRESH SUCCESSFUL!" -Level Success
+            Write-Log "Attempt: $attemptNumber" -Level Success
+            Write-Log "Total Time: $([math]::Round($pollResult.ElapsedTime.TotalMinutes, 2)) minutes" -Level Success
+            Write-Log "========================================" -Level Success
+            
+            return @{
+                Success = $true
+                FinalAttempt = $attemptNumber
+                TotalTime = $pollResult.ElapsedTime
+                ErrorMessage = $null
+            }
+        }
+        else {
+            # Failure - check elapsed time to decide on retry
+            $elapsedMinutes = $pollResult.ElapsedTime.TotalMinutes
+            
+            Write-Log "Cube refresh failed on attempt $attemptNumber" -Level Error
+            Write-Log "Error: $($pollResult.ErrorMessage)" -Level Error
+            Write-Log "Elapsed Time: $([math]::Round($elapsedMinutes, 2)) minutes" -Level Warning
+            
+            # Decision: Retry only if failed before timeout threshold
+            if ($elapsedMinutes -ge $TimeoutMinutes) {
+                Write-Log "Failure occurred after $TimeoutMinutes minute threshold. NOT retrying." -Level Warning
+                Write-Log "Please investigate the cube configuration or data source issues." -Level Warning
+                
+                return @{
+                    Success = $false
+                    FinalAttempt = $attemptNumber
+                    TotalTime = $pollResult.ElapsedTime
+                    ErrorMessage = "Cube refresh failed after $([math]::Round($elapsedMinutes, 2)) minutes (exceeded $TimeoutMinutes min threshold)"
+                }
+            }
+            else {
+                Write-Log "Failure occurred before $TimeoutMinutes minute threshold ($([math]::Round($elapsedMinutes, 2)) min). Will retry." -Level Warning
+                
+                if ($attemptNumber -lt $MaxRetries) {
+                    Write-Log "Waiting 30 seconds before retry..." -Level Info
+                    Start-Sleep -Seconds 30
+                    $attemptNumber++
+                    continue
+                }
+                else {
+                    Write-Log "Max retries ($MaxRetries) reached. Exiting." -Level Error
+                    
+                    return @{
+                        Success = $false
+                        FinalAttempt = $attemptNumber
+                        TotalTime = $pollResult.ElapsedTime
+                        ErrorMessage = "Cube refresh failed after $MaxRetries attempts"
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endregion
+
+#region Script Execution
+
+try {
+    # Display security warnings
+    Write-Host ""
+    Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+    Write-Host "║  ⚠️  SECURITY NOTICE ⚠️                                        ║" -ForegroundColor Red
+    Write-Host "║                                                                ║" -ForegroundColor Red
+    Write-Host "║  This script has:                                              ║" -ForegroundColor Yellow
+    Write-Host "║  • Hardcoded admin credentials (lines 85-86)                   ║" -ForegroundColor Yellow
+    Write-Host "║  • SSL certificate verification DISABLED                       ║" -ForegroundColor Yellow
+    Write-Host "║                                                                ║" -ForegroundColor Yellow
+    Write-Host "║  Use ONLY in development/test environments                     ║" -ForegroundColor Yellow
+    Write-Host "║  For production: Enable SSL and use secure credential storage  ║" -ForegroundColor Yellow
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host ""
+    
+    # Authenticate
+    $authSuccess = Connect-MicroStrategy
+    
+    if (-not $authSuccess) {
+        Write-Log "Authentication failed. Exiting." -Level Error
+        Write-Log "Please verify:" -Level Error
+        Write-Log "  1. Library URL is correct: $LibraryUrl" -Level Error
+        Write-Log "  2. Admin username is correct: $ADMIN_USERNAME" -Level Error
+        Write-Log "  3. Admin password is correct (check line 86)" -Level Error
+        Write-Log "  4. MicroStrategy server is accessible" -Level Error
+        exit 1
+    }
+    
+    # Get project ID if not provided
+    if (-not $ProjectId) {
+        $projects = Get-MicroStrategyProjects
+        if ($projects -and $projects.Count -gt 0) {
+            $selection = Read-Host "Select project number"
+            $selectedIndex = [int]$selection - 1
+            
+            if ($selectedIndex -ge 0 -and $selectedIndex -lt $projects.Count) {
+                $ProjectId = $projects[$selectedIndex].id
+                Write-Log "Selected Project: $($projects[$selectedIndex].name) (ID: $ProjectId)" -Level Info
+            }
+            else {
+                Write-Log "Invalid selection. Exiting." -Level Error
+                exit 1
+            }
+        }
+        else {
+            Write-Log "No projects found or unable to retrieve projects. Exiting." -Level Error
+            exit 1
+        }
+    }
+    
+    # Execute cube refresh with retry logic
+    $result = Start-CubeRefreshWithRetry -CubeId $CubeId -ProjectId $ProjectId `
+                                         -MaxRetries $MaxRetries `
+                                         -PollingIntervalSeconds $PollingIntervalSeconds `
+                                         -TimeoutMinutes $TimeoutMinutes
+    
+    # Final summary
+    Write-Log "" -Level Info
+    Write-Log "===== FINAL SUMMARY =====" -Level Info
+    Write-Log "Success: $($result.Success)" -Level $(if ($result.Success) { 'Success' } else { 'Error' })
+    Write-Log "Total Attempts: $($result.FinalAttempt)" -Level Info
+    if ($result.TotalTime) {
+        Write-Log "Total Time: $([math]::Round($result.TotalTime.TotalMinutes, 2)) minutes" -Level Info
+    }
+    if ($result.ErrorMessage) {
+        Write-Log "Error: $($result.ErrorMessage)" -Level Error
+    }
+    Write-Log "=========================" -Level Info
+    
+    # Set exit code
+    $exitCode = if ($result.Success) { 0 } else { 1 }
+}
+catch {
+    Write-Log "Unexpected error: $($_.Exception.Message)" -Level Error
+    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level Error
+    $exitCode = 1
+}
+finally {
+    # Always logout
+    if ($script:AuthToken) {
+        Disconnect-MicroStrategy
+    }
+}
+
+exit $exitCode
+
+#endregion
