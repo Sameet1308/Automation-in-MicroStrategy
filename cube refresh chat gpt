@@ -1,0 +1,381 @@
+<#
+.SYNOPSIS
+    Publish (refresh) an Intelligent Cube in MicroStrategy via REST,
+    poll its status every 5 seconds, and retry up to 3 times.
+
+.DESCRIPTION
+    - Uses POST /api/auth/login to get X-MSTR-AuthToken + cookies
+    - Uses POST /api/v2/cubes/{cubeId} to publish the cube (Publish cube v2)
+    - Uses HEAD /api/cubes/{cubeId} to read X-MSTR-CubeStatus (bit flags)
+      and checks for DssCubeReady (0x40) in the bit mask.
+    - If the cube:
+        * succeeds -> stop and return success
+        * fails before 45 minutes -> retry (max 3 attempts)
+        * runs 45+ minutes without reaching Ready -> stop and do NOT retry
+
+.PARAMETER LibraryUrl
+    Base Library URL, e.g. https://yourserver/MicroStrategyLibrary
+
+.PARAMETER CubeId
+    Object ID of the Intelligent Cube.
+
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$LibraryUrl,
+
+    [Parameter(Mandatory = $true)]
+    [string]$CubeId
+)
+
+#region CONFIGURATION (edit these)
+
+# MicroStrategy credentials & project
+$Username   = "your_mstr_username"
+$Password   = "your_mstr_password"
+$LoginMode  = 1          # 1 = Standard, 8 = Anonymous, 16 = LDAP
+$ProjectId  = "YOUR_PROJECT_ID"
+
+# Retry / timeout behavior
+$MaxAttempts          = 3
+$PollIntervalSeconds  = 5
+$MaxDurationMinutes   = 45
+
+# Optional: log file path
+$LogRoot = "C:\Logs"
+if (!(Test-Path $LogRoot)) { New-Item -Path $LogRoot -ItemType Directory -Force | Out-Null }
+$LogFile = Join-Path $LogRoot ("MSTR_CubeRefresh_{0}_{1}.log" -f $CubeId, (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+#endregion CONFIGURATION
+
+$ErrorActionPreference = "Stop"
+
+function Write-Log {
+    param([string]$Message)
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[{0}] {1}" -f $timestamp, $Message
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line
+}
+
+function Invoke-MstrLogin {
+    param(
+        [string]$BaseUrl,
+        [string]$User,
+        [string]$Pwd,
+        [int]$LoginMode
+    )
+
+    $loginUrl = ($BaseUrl.TrimEnd('/')) + "/api/auth/login"
+    Write-Log "Logging in to MicroStrategy REST at $loginUrl ..."
+
+    $body = @{
+        username   = $User
+        password   = $Pwd
+        loginMode  = $LoginMode
+        # applicationType is recommended in latest docs
+        applicationType = 35
+    } | ConvertTo-Json
+
+    $session = $null
+    $response = Invoke-WebRequest -Method POST `
+                                  -Uri $loginUrl `
+                                  -Body $body `
+                                  -ContentType "application/json" `
+                                  -SessionVariable session
+
+    $authToken = $response.Headers["X-MSTR-AuthToken"]
+    if (-not $authToken) {
+        throw "Login successful HTTP-wise but X-MSTR-AuthToken header is missing."
+    }
+
+    Write-Log "Login successful. Auth token acquired."
+
+    return [pscustomobject]@{
+        AuthToken = $authToken
+        WebSession = $session
+    }
+}
+
+function Invoke-MstrLogout {
+    param(
+        [string]$BaseUrl,
+        [string]$AuthToken,
+        $WebSession
+    )
+
+    try {
+        $logoutUrl = ($BaseUrl.TrimEnd('/')) + "/api/auth/logout"
+        Write-Log "Logging out from MicroStrategy REST ..."
+        Invoke-WebRequest -Method POST `
+                          -Uri $logoutUrl `
+                          -Headers @{ "X-MSTR-AuthToken" = $AuthToken } `
+                          -WebSession $WebSession | Out-Null
+        Write-Log "Logout successful."
+    }
+    catch {
+        Write-Log "Logout failed (non-blocking): $($_.Exception.Message)"
+    }
+}
+
+function Publish-CubeOnce {
+    param(
+        [string]$BaseUrl,
+        [string]$CubeId,
+        [string]$AuthToken,
+        [string]$ProjectId,
+        $WebSession
+    )
+
+    # Using Publish cube v2 as per latest REST docs: POST /api/v2/cubes/{cubeId}
+    $publishUrl = ($BaseUrl.TrimEnd('/')) + "/api/v2/cubes/$CubeId"
+    Write-Log "Publishing cube (refresh) via $publishUrl ..."
+
+    $headers = @{
+        "X-MSTR-AuthToken" = $AuthToken
+        "X-MSTR-ProjectID" = $ProjectId
+    }
+
+    $response = Invoke-WebRequest -Method POST `
+                                  -Uri $publishUrl `
+                                  -Headers $headers `
+                                  -WebSession $WebSession
+
+    Write-Log ("Publish request sent. HTTP status: {0}" -f $response.StatusCode)
+
+    # If MicroStrategy returns non-2xx, an exception would have been thrown above.
+    return $true
+}
+
+function Get-CubeStatus {
+    param(
+        [string]$BaseUrl,
+        [string]$CubeId,
+        [string]$AuthToken,
+        [string]$ProjectId,
+        $WebSession
+    )
+
+    # HEAD /api/cubes/{cubeId} returns X-MSTR-CubeStatus (bit vector EnumDSSCubeStates)
+    $statusUrl = ($BaseUrl.TrimEnd('/')) + "/api/cubes/$CubeId"
+
+    $headers = @{
+        "X-MSTR-AuthToken" = $AuthToken
+        "X-MSTR-ProjectID" = $ProjectId
+    }
+
+    $response = Invoke-WebRequest -Method HEAD `
+                                  -Uri $statusUrl `
+                                  -Headers $headers `
+                                  -WebSession $WebSession
+
+    $statusHeader = $response.Headers["X-MSTR-CubeStatus"]
+    if (-not $statusHeader) {
+        throw "Cube status header X-MSTR-CubeStatus is missing."
+    }
+
+    # Convert bitmask to integer
+    [int]$statusInt = [int]$statusHeader
+
+    # Key bits from EnumDSSCubeStates (documented values)
+    $DssCubeProcessing       = 0x00000001  # 1
+    $DssCubeReady            = 0x00000040  # 64
+    $DssCubeLoaded           = 0x00000020  # 32
+    $DssCubeLoadPending      = 0x00000080  # 128
+    $DssCubePendingForEngine = 0x00000200  # 512
+
+    $isReady      = ($statusInt -band $DssCubeReady)            -ne 0
+    $isProcessing = ($statusInt -band $DssCubeProcessing)       -ne 0 -or
+                    ($statusInt -band $DssCubeLoadPending)      -ne 0 -or
+                    ($statusInt -band $DssCubePendingForEngine) -ne 0
+
+    return [pscustomobject]@{
+        RawStatus   = $statusInt
+        IsReady     = $isReady
+        IsProcessing= $isProcessing
+    }
+}
+
+function Get-CubeInfoForError {
+    param(
+        [string]$BaseUrl,
+        [string]$CubeId,
+        [string]$AuthToken,
+        [string]$ProjectId,
+        $WebSession
+    )
+
+    try {
+        # GET /api/cubes?id={cubeId} returns info inc. name, status, size, last modification, etc.
+        $infoUrl = ($BaseUrl.TrimEnd('/')) + "/api/cubes?id=$CubeId"
+        $headers = @{
+            "X-MSTR-AuthToken" = $AuthToken
+            "X-MSTR-ProjectID" = $ProjectId
+        }
+
+        $response = Invoke-WebRequest -Method GET `
+                                      -Uri $infoUrl `
+                                      -Headers $headers `
+                                      -WebSession $WebSession
+        return $response.Content
+    }
+    catch {
+        return "Failed to retrieve cube info: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-CubeRefreshAttempt {
+    param(
+        [string]$BaseUrl,
+        [string]$CubeId,
+        [string]$AuthToken,
+        [string]$ProjectId,
+        $WebSession,
+        [int]$PollIntervalSeconds,
+        [int]$MaxDurationMinutes
+    )
+
+    $startTime = Get-Date
+    Publish-CubeOnce -BaseUrl $BaseUrl -CubeId $CubeId -AuthToken $AuthToken -ProjectId $ProjectId -WebSession $WebSession | Out-Null
+
+    Write-Log "Polling cube status every $PollIntervalSeconds seconds (max $MaxDurationMinutes minutes) ..."
+
+    while ($true) {
+        Start-Sleep -Seconds $PollIntervalSeconds
+
+        $elapsed = (Get-Date) - $startTime
+        if ($elapsed.TotalMinutes -ge $MaxDurationMinutes) {
+            Write-Log "Cube refresh exceeded $MaxDurationMinutes minutes (timeout). Treating as failure after timeout."
+            $cubeInfo = Get-CubeInfoForError -BaseUrl $BaseUrl -CubeId $CubeId -AuthToken $AuthToken -ProjectId $ProjectId -WebSession $WebSession
+            Write-Log "Cube info at timeout: $cubeInfo"
+
+            return [pscustomobject]@{
+                Success  = $false
+                TimedOut = $true
+                Message  = "Timed out after $([math]::Round($elapsed.TotalMinutes,2)) minutes."
+            }
+        }
+
+        $status = Get-CubeStatus -BaseUrl $BaseUrl -CubeId $CubeId -AuthToken $AuthToken -ProjectId $ProjectId -WebSession $WebSession
+        Write-Log ("Polled status: Raw={0}, IsReady={1}, IsProcessing={2}" -f $status.RawStatus, $status.IsReady, $status.IsProcessing)
+
+        if ($status.IsReady) {
+            Write-Log "Cube is READY (DssCubeReady bit set). Refresh successful."
+            return [pscustomobject]@{
+                Success  = $true
+                TimedOut = $false
+                Message  = "Cube ready. Raw status: $($status.RawStatus)"
+            }
+        }
+
+        if (-not $status.IsProcessing) {
+            # Not ready, not processing -> treat as failure
+            Write-Log "Cube is neither ready nor processing. Treating as failure."
+            $cubeInfo = Get-CubeInfoForError -BaseUrl $BaseUrl -CubeId $CubeId -AuthToken $AuthToken -ProjectId $ProjectId -WebSession $WebSession
+            Write-Log "Cube info at failure: $cubeInfo"
+
+            return [pscustomobject]@{
+                Success  = $false
+                TimedOut = $false
+                Message  = "Cube status=$($status.RawStatus) (not ready, not processing)."
+            }
+        }
+
+        # Else: still processing, keep looping
+    }
+}
+
+# ===================== MAIN FLOW =====================
+
+Write-Log "=== MicroStrategy Cube Refresh Script Started ==="
+Write-Log "Cube ID: $CubeId"
+Write-Log "Library URL: $LibraryUrl"
+
+$connection = $null
+try {
+    $connection = Invoke-MstrLogin -BaseUrl $LibraryUrl -User $Username -Pwd $Password -LoginMode $LoginMode
+}
+catch {
+    Write-Log "Login failed: $($_.Exception.Message)"
+    throw
+}
+
+try {
+    $attempt = 1
+    $finalResult = $null
+
+    while ($attempt -le $MaxAttempts) {
+        Write-Log "----- Attempt $attempt of $MaxAttempts -----"
+
+        try {
+            $result = Invoke-CubeRefreshAttempt -BaseUrl $LibraryUrl `
+                                                -CubeId $CubeId `
+                                                -AuthToken $connection.AuthToken `
+                                                -ProjectId $ProjectId `
+                                                -WebSession $connection.WebSession `
+                                                -PollIntervalSeconds $PollIntervalSeconds `
+                                                -MaxDurationMinutes $MaxDurationMinutes
+
+            if ($result.Success) {
+                Write-Log "Cube refresh completed successfully on attempt $attempt."
+                $finalResult = $result
+                break
+            }
+            elseif ($result.TimedOut) {
+                Write-Log "Cube refresh attempt $attempt failed due to timeout (>= $MaxDurationMinutes minutes). Will NOT retry."
+                $finalResult = $result
+                break
+            }
+            else {
+                Write-Log "Cube refresh attempt $attempt failed BEFORE timeout: $($result.Message)"
+
+                if ($attempt -lt $MaxAttempts) {
+                    Write-Log "Retrying cube refresh (since failure occurred before $MaxDurationMinutes minutes)..."
+                }
+                else {
+                    Write-Log "Max attempts ($MaxAttempts) reached. Stopping."
+                    $finalResult = $result
+                }
+            }
+        }
+        catch {
+            # Hard failure in the attempt flow -> treat as failure before timeout
+            $msg = "Exception during attempt $attempt: $($_.Exception.Message)"
+            Write-Log $msg
+
+            if ($attempt -lt $MaxAttempts) {
+                Write-Log "Retrying cube refresh (failure before timeout)..."
+            }
+            else {
+                Write-Log "Max attempts ($MaxAttempts) reached. Stopping."
+                $finalResult = [pscustomobject]@{
+                    Success  = $false
+                    TimedOut = $false
+                    Message  = $msg
+                }
+            }
+        }
+
+        $attempt++
+    }
+
+    Write-Log "=== Final Result ==="
+    if ($finalResult -and $finalResult.Success) {
+        Write-Log "Overall status: SUCCESS"
+    }
+    else {
+        Write-Log "Overall status: FAILED"
+        if ($finalResult) {
+            Write-Log "Reason: $($finalResult.Message)"
+        }
+    }
+}
+finally {
+    if ($connection) {
+        Invoke-MstrLogout -BaseUrl $LibraryUrl -AuthToken $connection.AuthToken -WebSession $connection.WebSession
+    }
+    Write-Log "=== MicroStrategy Cube Refresh Script Finished ==="
+}
