@@ -1,0 +1,101 @@
+Hi All,
+
+Adding my perspective here.
+
+⸻
+
+1. GenAI + Unity Catalog: Feasible but Only With Strong Foundations
+
+GenAI can technically connect to Unity Catalog and interpret metadata, but the accuracy of its outputs depends heavily on how disciplined the data environment is. This includes:
+	•	Clear and consistent naming conventions
+	•	Documented business terms and metric definitions
+	•	Proper tagging and data classification
+	•	Meaningful table relationships
+	•	Reliable lineage
+	•	Well-structured access rules
+
+If these elements are not in place, AI may misinterpret the metadata and return different results depending on how a question is phrased.
+
+⸻
+
+2. BI vs AI: How Users Get Answers Matters
+
+Traditional BI dashboards give users a validated and certified view with just a few selections. All formulas, business rules, and SQL logic go through a structured review process, testing, and final sign-off before anything reaches the dashboards. The business trusts these numbers because they are governed and consistent.
+
+AI, on the other hand, generates logic dynamically based on prompts. This may require multiple prompt attempts to reach the “correct” value, and two users may receive slightly different answers. Without strong metadata discipline, consistency becomes difficult to maintain.
+
+⸻
+
+3. Additional Context: Business Logic Adjustments Are Critical
+
+In most real-world BI environments, raw tables from Unity Catalog are not used directly. Teams apply additional:
+	•	Business transformations
+	•	Adjustments and corrections
+	•	Aggregation rules
+	•	Exception handling
+	•	Validations with business stakeholders
+
+Only after this process is complete are the metrics considered final and ready for reporting.
+This step is essential for accuracy, and it is something AI cannot reliably infer or decide on the fly.
+
+This is a key reason why governed BI remains the authoritative source of truth.
+
+⸻
+
+4. Developers vs Business Users: Different Needs
+
+There is also a difference in how AI can support developers versus business users.
+
+For Developers
+
+Tools like Databricks Genie already help with:
+	•	NL-to-SQL
+	•	Metadata exploration
+	•	Schema understanding
+	•	Code suggestions
+
+Here, AI can boost productivity without impacting data trust.
+
+For Business Users
+
+They depend on consistent definitions and certified metrics. Dynamic SQL generation without governance introduces risk and inconsistency.
+
+⸻
+
+5. Where GenAI Truly Adds Value
+
+Instead of trying to replace governed BI logic, GenAI can provide value in areas such as:
+
+For Developers
+	•	Explaining lineage, joins, filters, dependencies
+	•	Generating documentation and impact analysis
+	•	Helping understand complex schemas
+
+For Business Users
+	•	Explaining why two numbers differ
+	•	Root-cause analysis of anomalies or variances
+	•	Summarizing trends or notable changes
+	•	Interpreting “what might have caused this?”
+
+These use cases complement BI instead of bypassing its governance.
+
+⸻
+
+6. High-Level Proposal: A More Strategic AI Direction
+
+Rather than focusing on natural-language-to-SQL, a more impactful approach could be:
+	•	AI Metadata & Insight Assistant
+Helps users understand lineage, definitions, relationships, joins, filters, and potential issues.
+	•	BI Companion Assistant
+Works alongside dashboards to explain insights, variances, and anomalies.
+	•	Developer Productivity Assistant
+Supports faster development, documentation, and schema understanding.
+
+This keeps BI as the source of truth while allowing AI to enhance understanding, speed, and user experience.
+
+⸻
+
+Happy to discuss further or help refine this direction.
+
+Thanks,
+Sameet
