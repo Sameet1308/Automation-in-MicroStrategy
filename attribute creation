@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""
+create_attributes.py
+====================
+
+This script provides a command‑line utility for creating MicroStrategy
+attributes via the Strategy REST API using a CSV definition file.  It
+implements the common workflow described in the official MicroStrategy
+documentation: authenticate, create a changeset (with `schemaEdit=true`),
+create one or more attribute objects within that changeset, commit
+the changeset, and reload the schema【271926009649641†L89-L100】.  The script
+accepts connection details (base URL, username, password, project ID),
+a path to a CSV file containing attribute definitions, and an option
+to disable HTTPS certificate warnings.
+
+CSV Format
+----------
+
+Each row in the CSV defines one attribute.  Mandatory columns for
+the attribute are:
+
+```
+attribute_name          – human‑readable name of the attribute.
+destinationFolderId     – the GUID of the folder where the attribute will
+                          be created【438852581653064†L186-L304】.
+key_form_name           – the name of the attribute form that uniquely
+                          identifies the attribute (the key)【438852581653064†L270-L272】.
+display_forms           – comma‑separated list of form names to be used for
+                          both `reportDisplays` and `browseDisplays`【438852581653064†L273-L283】.
+forms_names             – semicolon‑separated list of form names; each entry
+                          defines a separate form for the attribute.
+forms_expression_values – semicolon‑separated list of column expressions
+                          (one per form).  Each expression is the value of
+                          the column in the lookup table (for example
+                          “SUBCAT_ID”)【438852581653064†L196-L213】.
+forms_table_ids         – semicolon‑separated groups of table IDs.  Within
+                          each group, multiple table IDs should be separated
+                          by `|` (vertical bar).  For example:
+                          `table1|table2;table3` defines two forms: the
+                          first form uses `table1` and `table2`; the second
+                          form uses `table3`.
+forms_table_names       – semicolon‑separated groups of table names.  Each
+                          group must align with `forms_table_ids`.  Table
+                          names within a group are separated by `|`.
+
+Optional columns:
+
+```
+attribute_lookup_table_id   – GUID of the attribute’s lookup table【438852581653064†L265-L268】.
+attribute_lookup_table_name – Name of the attribute’s lookup table【438852581653064†L265-L268】.
+sort_forms                  – comma‑separated list of form names to be used for
+                              default sorting.  If omitted, no default sorts
+                              are defined.
+forms_categories            – semicolon‑separated list of categories for each
+                              form (e.g. “ID”, “DESC”).
+forms_display_formats       – semicolon‑separated list of display formats
+                              (e.g. “number”, “text”).
+forms_descriptions          – semicolon‑separated list of descriptions for
+                              each form.
+forms_aliases               – semicolon‑separated list of aliases for each
+                              form.  If omitted, the alias defaults to the
+                              expression value.
+forms_is_multilingual       – semicolon‑separated list of boolean values
+                              (“true” or “false”) indicating whether a form
+                              supports multiple locales【438852581653064†L234-L239】.
+forms_lookup_table_ids      – semicolon‑separated list of lookup table IDs
+                              specific to each form.  If provided, these
+                              override `attribute_lookup_table_id` for that
+                              form【438852581653064†L227-L231】.
+forms_lookup_table_names    – semicolon‑separated list of lookup table
+                              names specific to each form【438852581653064†L227-L231】.
+```
+
+The script assembles a JSON payload for each attribute using these
+columns.  Mandatory payload fields (`destinationFolderId`, `keyForm`,
+`displays`, and either `attributeLookupTable` or per‑form
+`lookupTable`) are enforced in accordance with MicroStrategy’s
+requirements【438852581653064†L265-L272】.
+
+Usage:
+
+```bash
+python3 create_attributes.py \
+  --base_url https://your‑server/MicroStrategyLibrary \
+  --username yourUser \
+  --password yourPassword \
+  --project_id yourProjectGuid \
+  --csv path/to/attributes.csv \
+  --disable-warnings
+```
+
+When `--disable-warnings` is passed, the script suppresses SSL
+certificate warnings using `urllib3.disable_warnings`.
+
+Note: This script uses the `requests` and `pandas` packages.  Install
+them via pip if necessary: `pip install requests pandas`.
+"""
+
+import argparse
+import json
+from typing import List, Dict, Optional
+
+import pandas as pd
+import requests
+import urllib3
+
+
+def disable_ssl_warnings() -> None:
+    """Suppress insecure HTTPS warnings (optional)."""
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def login(base_url: str, username: str, password: str, login_mode: int = 1) -> str:
+    """Authenticate with MicroStrategy and return the X‑MSTR‑AuthToken.
+
+    Args:
+        base_url: Base URL of the MicroStrategy Library (e.g. https://server/MicroStrategyLibrary).
+        username: User login name.
+        password: User password.
+        login_mode: Authentication mode (1 for standard login).
+
+    Returns:
+        Authorization token string.
+
+    Raises:
+        requests.HTTPError: If the login fails.
+    """
+    auth_url = f"{base_url}/api/auth/login"
+    payload = {
+        "username": username,
+        "password": password,
+        "loginMode": login_mode,
+    }
+    response = requests.post(auth_url, json=payload, verify=False)
+    response.raise_for_status()
+    # MicroStrategy returns the auth token in a response header
+    token = response.headers.get("X-MSTR-AuthToken")
+    if not token:
+        raise RuntimeError("Authentication failed: missing X-MSTR-AuthToken")
+    return token
+
+
+def create_changeset(base_url: str, project_id: str, auth_token: str) -> str:
+    """Create a changeset for schema editing and return its ID.
+
+    According to the documentation, changesets used for creating or updating
+    schema objects require `schemaEdit=true`【271926009649641†L89-L100】.
+    """
+    url = f"{base_url}/api/model/changesets?schemaEdit=true"
+    headers = {
+        "accept": "application/json",
+        "X-MSTR-AuthToken": auth_token,
+        "X-MSTR-ProjectID": project_id,
+    }
+    response = requests.post(url, headers=headers, verify=False)
+    response.raise_for_status()
+    data = response.json()
+    changeset_id = data.get("id")
+    if not changeset_id:
+        raise RuntimeError("Failed to create changeset: no ID returned")
+    return changeset_id
+
+
+def commit_changeset(base_url: str, changeset_id: str, auth_token: str) -> None:
+    """Commit the specified changeset."""
+    url = f"{base_url}/api/model/changesets/{changeset_id}/commit"
+    headers = {
+        "accept": "application/json",
+        "X-MSTR-AuthToken": auth_token,
+        "X-MSTR-MS-Changeset": changeset_id,
+    }
+    response = requests.post(url, headers=headers, verify=False)
+    response.raise_for_status()
+
+
+def reload_schema(base_url: str, project_id: str, auth_token: str) -> None:
+    """Reload the schema after committing a changeset (synchronous call).
+
+    The documentation states that a schema reload is necessary when schema
+    objects are created or modified within a changeset【271926009649641†L89-L100】.
+    """
+    url = f"{base_url}/api/model/schema/reload"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "X-MSTR-AuthToken": auth_token,
+        "X-MSTR-ProjectID": project_id,
+    }
+    payload = {
+        "updateTypes": ["table_key", "entry_level", "logical_size", "clear_element_cache"],
+    }
+    response = requests.post(url, headers=headers, json=payload, verify=False)
+    response.raise_for_status()
+
+
+def create_attribute(
+    base_url: str,
+    changeset_id: str,
+    auth_token: str,
+    attribute_body: Dict,
+) -> Dict:
+    """Send a POST request to create a single attribute in the active changeset.
+
+    Returns the response JSON for further inspection.
+    """
+    url = f"{base_url}/api/model/attributes"
+    headers = {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "X-MSTR-AuthToken": auth_token,
+        "X-MSTR-MS-Changeset": changeset_id,
+    }
+    response = requests.post(url, headers=headers, json=attribute_body, verify=False)
+    response.raise_for_status()
+    return response.json()
+
+
+def parse_semicolon_list(value: Optional[str]) -> List[str]:
+    """Split a semicolon‑separated string into a list, handling empty values."""
+    if value is None or str(value).strip() == "":
+        return []
+    return [item.strip() for item in str(value).split(";")]
+
+
+def parse_pipe_list(value: Optional[str]) -> List[List[str]]:
+    """Split semicolon‑separated groups of pipe‑separated items.
+
+    For example:
+        "a|b;c" -> [["a", "b"], ["c"]]
+    """
+    if value is None or str(value).strip() == "":
+        return []
+    groups = []
+    for group in str(value).split(";"):
+        items = [item.strip() for item in group.split("|") if item.strip()]
+        groups.append(items)
+    return groups
+
+
+def build_attribute_body(row: pd.Series) -> Dict:
+    """Construct the JSON payload for an attribute from a CSV row.
+
+    This function interprets the mandatory and optional columns documented
+    in the module docstring to build the attribute definition.  It enforces
+    required payload fields such as `information.destinationFolderId`,
+    `keyForm`, `displays`, and a lookup table definition (either at the
+    attribute or form level)【438852581653064†L265-L272】.
+    """
+    # Mandatory attribute-level fields
+    attr_name = row.get("attribute_name")
+    dest_folder_id = row.get("destinationFolderId")
+    key_form_name = row.get("key_form_name")
+    display_forms = []
+    display_raw = row.get("display_forms")
+    if display_raw:
+        display_forms = [name.strip() for name in str(display_raw).split(",") if name.strip()]
+    if not attr_name or not dest_folder_id or not key_form_name or not display_forms:
+        raise ValueError(
+            f"Row missing required fields: attribute_name={attr_name}, "
+            f"destinationFolderId={dest_folder_id}, key_form_name={key_form_name}, "
+            f"display_forms={display_raw}"
+        )
+
+    # Mandatory forms list
+    form_names = parse_semicolon_list(row.get("forms_names"))
+    expr_values = parse_semicolon_list(row.get("forms_expression_values"))
+    table_ids_groups = parse_pipe_list(row.get("forms_table_ids"))
+    table_names_groups = parse_pipe_list(row.get("forms_table_names"))
+    if not form_names or not expr_values or not table_ids_groups or not table_names_groups:
+        raise ValueError(
+            "Each row must define at least one form via forms_names, "
+            "forms_expression_values, forms_table_ids, and forms_table_names."
+        )
+    if not (len(form_names) == len(expr_values) == len(table_ids_groups) == len(table_names_groups)):
+        raise ValueError(
+            "forms_* columns must have the same number of semicolon‑separated values."
+        )
+
+    # Optional per-form lists
+    categories = parse_semicolon_list(row.get("forms_categories"))
+    display_formats = parse_semicolon_list(row.get("forms_display_formats"))
+    descriptions = parse_semicolon_list(row.get("forms_descriptions"))
+    aliases = parse_semicolon_list(row.get("forms_aliases"))
+    is_multilinguals = parse_semicolon_list(row.get("forms_is_multilingual"))
+    lookup_ids = parse_semicolon_list(row.get("forms_lookup_table_ids"))
+    lookup_names = parse_semicolon_list(row.get("forms_lookup_table_names"))
+
+    forms: List[Dict] = []
+    num_forms = len(form_names)
+    for i in range(num_forms):
+        form: Dict[str, object] = {
+            "name": form_names[i],
+            "expressions": [
+                {
+                    "expression": {
+                        "tokens": [
+                            {"value": expr_values[i]}
+                        ]
+                    },
+                    "tables": [
+                        {
+                            "objectId": table_ids_groups[i][j],
+                            "subType": "logical_table",
+                            "name": table_names_groups[i][j],
+                        }
+                        for j in range(len(table_ids_groups[i]))
+                    ],
+                }
+            ],
+        }
+        # Add optional fields if provided
+        if i < len(categories) and categories[i]:
+            form["category"] = categories[i]
+        if i < len(display_formats) and display_formats[i]:
+            form["displayFormat"] = display_formats[i]
+        if i < len(descriptions) and descriptions[i]:
+            form["description"] = descriptions[i]
+        if i < len(aliases) and aliases[i]:
+            form["alias"] = aliases[i]
+        if i < len(is_multilinguals) and is_multilinguals[i]:
+            form["isMultilingual"] = is_multilinguals[i].strip().lower() == "true"
+        # Per‑form lookup table overrides attribute-level lookup
+        if i < len(lookup_ids) and lookup_ids[i] and i < len(lookup_names) and lookup_names[i]:
+            form["lookupTable"] = {
+                "objectId": lookup_ids[i],
+                "subType": "logical_table",
+                "name": lookup_names[i],
+            }
+        forms.append(form)
+
+    # Attribute-level lookup table (optional)
+    attr_lookup_table_id = row.get("attribute_lookup_table_id")
+    attr_lookup_table_name = row.get("attribute_lookup_table_name")
+    attribute_lookup_table: Optional[Dict[str, str]] = None
+    if attr_lookup_table_id and attr_lookup_table_name:
+        attribute_lookup_table = {
+            "objectId": str(attr_lookup_table_id),
+            "subType": "logical_table",
+            "name": str(attr_lookup_table_name),
+        }
+
+    # Assemble the attribute payload
+    attribute_body: Dict[str, object] = {
+        "information": {
+            "subType": "attribute",
+            "name": attr_name,
+            "destinationFolderId": dest_folder_id,
+        },
+        "forms": forms,
+        "keyForm": {"name": key_form_name},
+        "displays": {
+            "reportDisplays": [{"name": name} for name in display_forms],
+            "browseDisplays": [{"name": name} for name in display_forms],
+        },
+    }
+
+    if attribute_lookup_table is not None:
+        attribute_body["attributeLookupTable"] = attribute_lookup_table
+
+    # Sorts (optional)
+    sort_raw = row.get("sort_forms")
+    if sort_raw:
+        sort_forms_list = [name.strip() for name in str(sort_raw).split(",") if name.strip()]
+        attribute_body["sorts"] = {
+            "reportSorts": [
+                {"form": {"name": name}, "ascending": True}
+                for name in sort_forms_list
+            ],
+            "browseSorts": [
+                {"form": {"name": name}, "ascending": True}
+                for name in sort_forms_list
+            ],
+        }
+
+    return attribute_body
+
+
+def process_csv_and_create_attributes(
+    base_url: str,
+    username: str,
+    password: str,
+    project_id: str,
+    csv_path: str,
+    disable_warnings: bool = False,
+) -> None:
+    """Main driver function: authenticate, create a changeset, build attributes from CSV, commit and reload."""
+    if disable_warnings:
+        disable_ssl_warnings()
+    # Authenticate and obtain token
+    auth_token = login(base_url, username, password)
+    # Create a changeset for schema editing
+    changeset_id = create_changeset(base_url, project_id, auth_token)
+    print(f"Created changeset {changeset_id}")
+    # Read CSV with pandas
+    df = pd.read_csv(csv_path)
+    # Iterate through rows and create each attribute
+    for index, row in df.iterrows():
+        try:
+            attribute_body = build_attribute_body(row)
+        except Exception as exc:
+            print(f"Error parsing row {index}: {exc}")
+            continue
+        try:
+            result = create_attribute(base_url, changeset_id, auth_token, attribute_body)
+            attr_name = result.get("information", {}).get("name", attribute_body["information"]["name"])
+            attr_id = result.get("information", {}).get("id")
+            if attr_id:
+                print(f"Created attribute '{attr_name}' (ID: {attr_id})")
+            else:
+                print(f"Created attribute '{attr_name}'")
+        except Exception as exc:
+            print(f"Failed to create attribute from row {index}: {exc}")
+    # Commit and reload schema
+    commit_changeset(base_url, changeset_id, auth_token)
+    print(f"Committed changeset {changeset_id}")
+    reload_schema(base_url, project_id, auth_token)
+    print("Schema reloaded successfully")
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Create MicroStrategy attributes using the REST API from a CSV definition file."
+    )
+    parser.add_argument("--base_url", required=True, help="Base URL of MicroStrategy Library, e.g. https://server/MicroStrategyLibrary")
+    parser.add_argument("--username", required=True, help="MicroStrategy username")
+    parser.add_argument("--password", required=True, help="MicroStrategy password")
+    parser.add_argument("--project_id", required=True, help="Project GUID where attributes will be created")
+    parser.add_argument("--csv", required=True, help="Path to CSV file defining attributes")
+    parser.add_argument(
+        "--disable-warnings",
+        action="store_true",
+        help="Suppress SSL certificate warnings (useful when using self‑signed certificates)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    process_csv_and_create_attributes(
+        base_url=args.base_url.rstrip("/"),
+        username=args.username,
+        password=args.password,
+        project_id=args.project_id,
+        csv_path=args.csv,
+        disable_warnings=args.disable_warnings,
+    )
+
+
+if __name__ == "__main__":
+    main()
