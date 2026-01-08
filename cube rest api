@@ -1,0 +1,7 @@
+MicroStrategy Cube REST API & mstrio Summary
+
+This guide summarizes the official MicroStrategy REST API calls and mstrio‑py functions you can use to monitor, manage and publish Intelligent Cubes.  It focuses on operations that help you find when a cube was last refreshed or published, retrieve its definition, and create or update cube objects.  Citations point to official documentation or open‑source code.
+
+1 Monitoring cube caches (last refresh/publish)
+
+To see when a cube was last refreshed or originally published you need to inspect its cube cache.  MicroStrategy’s Monitors API exposes endpoints under the /api/monitors/caches/cubes path for listing and managing caches.  Each cache record contains metadata such as the cube’s project ID, creator, loaded/unloaded state, creationTime (first publication) and lastUpdateTime (most recent refresh)【325499205630218†L104-L117】.  The main endpoints are:
