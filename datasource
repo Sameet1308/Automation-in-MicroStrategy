@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+MicroStrategy: Database instances → projects → datasource properties (tabular).
+
+What it does:
+- Logs in with REST API (verify=False, warnings disabled)
+- Lists all datasources (database instances)
+- For each datasource:
+  - Gets full definition / advanced properties (connection string, etc.)
+  - Gets projects mapped to that datasource
+- Produces a flattened CSV with one row per (datasource, project). [web:9]
+"""
+
+import requests
+import urllib3
+import warnings
+import pandas as pd
+from typing import Dict, Any, List
+
+# ==========================
+# CONFIG – EDIT THESE
+# ==========================
+SERVER_URL = "https://your-server/MicroStrategyLibrary"  # no trailing slash
+USERNAME = "your-username"
+PASSWORD = "your-password"
+
+# SSL verify and warnings
+VERIFY_SSL = False  # you explicitly want verify=False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore")
+
+
+# ==========================
+# AUTH HELPERS
+# ==========================
+
+def mstr_login(server: str, username: str, password: str) -> Dict[str, Any]:
+    """
+    Log in using POST /api/auth/login.
+    Returns dict with session, headers, token, cookies. [web:36]
+    """
+    login_url = f"{server}/api/auth/login"
+    payload = {
+        "username": username,
+        "password": password,
+        "loginMode": 1  # standard authentication
+    }
+
+    session = requests.Session()
+    session.verify = VERIFY_SSL
+
+    resp = session.post(login_url, json=payload)
+    resp.raise_for_status()
+
+    token = resp.headers.get("X-MSTR-AuthToken")
+    if not token:
+        raise RuntimeError("Login succeeded but no X-MSTR-AuthToken header found")
+
+    headers = {
+        "X-MSTR-AuthToken": token,
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+    return {
+        "session": session,
+        "headers": headers,
+        "token": token
+    }
+
+
+def mstr_logout(server: str, auth: Dict[str, Any]) -> None:
+    """
+    Log out using POST /api/auth/logout (best effort). [web:36]
+    """
+    url = f"{server}/api/auth/logout"
+    session: requests.Session = auth["session"]
+    headers = {"X-MSTR-AuthToken": auth["token"]}
+
+    try:
+        session.post(url, headers=headers)
+    except Exception:
+        # Ignore logout errors
+        pass
+
+
+# ==========================
+# DATASOURCE HELPERS
+# ==========================
+
+def get_all_datasources(server: str, auth: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    List all datasources (database instances).
+    Typical endpoint: GET /api/datasources with paging. [web:9]
+    """
+    session: requests.Session = auth["session"]
+    headers = auth["headers"]
+    url = f"{server}/api/datasources"
+
+    datasources: List[Dict[str, Any]] = []
+    offset = 0
+    limit = 1000
+
+    while True:
+        params = {"offset": offset, "limit": limit}
+        resp = session.get(url, headers=headers, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Depending on version, data may be list or { "data": [...] }
+        if isinstance(data, dict) and "data" in 
+            batch = data["data"]
+        else:
+            batch = data
+
+        if not batch:
+            break
+
+        datasources.extend(batch)
+        if len(batch) < limit:
+            break
+
+        offset += limit
+
+    return datasources
+
+
+def get_datasource_definition(server: str, auth: Dict[str, Any], datasource_id: str) -> Dict[str, Any]:
+    """
+    Get datasource definition & advanced properties.
+    The documented pattern is GET /api/datasources/{datasourceId}/definition. [web:9]
+    This is where connectionString (with DSN or DSN-less details) is returned. [web:16]
+    """
+    session: requests.Session = auth["session"]
+    headers = auth["headers"]
+    url = f"{server}/api/datasources/{datasource_id}/definition"
+
+    resp = session.get(url, headers=headers)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_datasource_projects(server: str, auth: Dict[str, Any], datasource_id: str) -> List[Dict[str, Any]]:
+    """
+    Get list of projects mapped to a given datasource.
+    Typical pattern: GET /api/datasources/{datasourceId}/projects. [web:9]
+    """
+    session: requests.Session = auth["session"]
+    headers = auth["headers"]
+    url = f"{server}/api/datasources/{datasource_id}/projects"
+
+    resp = session.get(url, headers=headers)
+    if resp.status_code == 404:
+        # Some versions may not have this endpoint; treat as no explicit mapping.
+        return []
+    resp.raise_for_status()
+
+    data = resp.json()
+    if isinstance(data, dict) and "data" in 
+        return data["data"]
+    elif isinstance(data, list):
+        return data
+    else:
+        return []
+
+
+# ==========================
+# UTILS
+# ==========================
+
+def flatten_dict(d: Dict[str, Any], parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
+    """
+    Recursively flattens nested dicts to one-level dict with dotted keys.
+    Example:
+      {"connection": {"server": "x", "port": 1433}}
+    becomes:
+      {"connection.server": "x", "connection.port": 1433}
+    """
+    items: List = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
+
+# ==========================
+# MAIN BUILDER
+# ==========================
+
+def build_datasource_table(server: str, username: str, password: str) -> pd.DataFrame:
+    """
+    Full workflow:
+      - Login
+      - List all datasources
+      - For each datasource:
+          - Get full definition/advanced properties
+          - Get mapped projects
+      - Return DataFrame with:
+          datasource_id, datasource_name, type, subtype,
+          project_id, project_name,
+          + all flattened definition properties
+        (including connectionString that contains DSN or DSN-less details). [web:9][web:16]
+    """
+    auth = mstr_login(server, username, password)
+    session = auth["session"]
+    headers = auth["headers"]
+    # keep "headers" in auth for helper functions
+    auth["headers"] = headers
+
+    try:
+        datasources = get_all_datasources(server, auth)
+
+        rows: List[Dict[str, Any]] = []
+
+        for ds in datasources:
+            ds_id = ds.get("id")
+            ds_name = ds.get("name")
+            ds_type = ds.get("type")
+            ds_subtype = ds.get("subType") or ds.get("subtype")
+
+            # Full definition: includes connection string & DSN/DSN-less info. [web:16]
+            try:
+                full_def = get_datasource_definition(server, auth, ds_id)
+            except requests.HTTPError as e:
+                full_def = {"definition_error": str(e)}
+
+            flat_def = flatten_dict(full_def)
+
+            # Projects mapped to this datasource
+            projects = get_datasource_projects(server, auth, ds_id)
+
+            if not projects:
+                # Still output a row so datasource is not lost
+                row = {
+                    "datasource_id": ds_id,
+                    "datasource_name": ds_name,
+                    "datasource_type": ds_type,
+                    "datasource_subtype": ds_subtype,
+                    "project_id": None,
+                    "project_name": None
+                }
+                row.update(flat_def)
+                rows.append(row)
+            else:
+                for proj in projects:
+                    proj_id = proj.get("id")
+                    proj_name = proj.get("name")
+
+                    row = {
+                        "datasource_id": ds_id,
+                        "datasource_name": ds_name,
+                        "datasource_type": ds_type,
+                        "datasource_subtype": ds_subtype,
+                        "project_id": proj_id,
+                        "project_name": proj_name
+                    }
+                    row.update(flat_def)
+                    rows.append(row)
+
+        df = pd.DataFrame(rows)
+        return df
+
+    finally:
+        mstr_logout(server, auth)
+        session.close()
+
+
+def main():
+    df = build_datasource_table(
+        server=SERVER_URL,
+        username=USERNAME,
+        password=PASSWORD
+    )
+
+    # Preview in console
+    pd.set_option("display.max_columns", None)
+    print(df.head())
+
+    # Save full table to CSV
+    output_file = "mstr_database_instances_projects_properties.csv"
+    df.to_csv(output_file, index=False)
+    print(f"Saved: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
