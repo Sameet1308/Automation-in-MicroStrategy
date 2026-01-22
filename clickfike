@@ -1,0 +1,262 @@
+import os
+import argparse
+from typing import Dict, Set, List, Tuple
+import pandas as pd
+
+
+# ----------------------------
+# Disjoint Set Union (Union-Find) for app components
+# ----------------------------
+class DSU:
+    def __init__(self):
+        self.parent = {}
+        self.rank = {}
+
+    def add(self, x: str) -> None:
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+
+    def find(self, x: str) -> str:
+        # Path compression
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        # Union by rank
+        if self.rank[ra] < self.rank[rb]:
+            self.parent[ra] = rb
+        elif self.rank[ra] > self.rank[rb]:
+            self.parent[rb] = ra
+        else:
+            self.parent[rb] = ra
+            self.rank[ra] += 1
+
+
+def safe_mkdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def clean_str_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip()
+
+
+def build_mappings_from_single_csv(
+    df: pd.DataFrame,
+    user_col: str,
+    group_col: str,
+    app_col: str
+) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """
+    Returns:
+      user_groups: user -> set(groups)
+      group_apps:  group -> set(apps)
+      user_apps:   user -> set(apps)  (derived via group membership)
+    """
+
+    # Keep only relevant cols
+    df = df[[user_col, group_col, app_col]].copy()
+
+    # Normalize strings; preserve NaN before converting
+    for c in [user_col, group_col, app_col]:
+        df[c] = df[c].where(df[c].notna(), None)
+
+    # Build user -> groups
+    user_groups: Dict[str, Set[str]] = {}
+    ug = df.dropna(subset=[user_col, group_col])[[user_col, group_col]].copy()
+    ug[user_col] = clean_str_series(ug[user_col])
+    ug[group_col] = clean_str_series(ug[group_col])
+    ug = ug[(ug[user_col] != "") & (ug[group_col] != "")]
+    for u, g in zip(ug[user_col], ug[group_col]):
+        user_groups.setdefault(u, set()).add(g)
+
+    # Build group -> apps
+    group_apps: Dict[str, Set[str]] = {}
+    ga = df.dropna(subset=[group_col, app_col])[[group_col, app_col]].copy()
+    ga[group_col] = clean_str_series(ga[group_col])
+    ga[app_col] = clean_str_series(ga[app_col])
+    ga = ga[(ga[group_col] != "") & (ga[app_col] != "")]
+    for g, a in zip(ga[group_col], ga[app_col]):
+        group_apps.setdefault(g, set()).add(a)
+
+    # Derive user -> apps via group membership
+    user_apps: Dict[str, Set[str]] = {}
+    for u, groups in user_groups.items():
+        apps = set()
+        for g in groups:
+            apps |= group_apps.get(g, set())
+        user_apps[u] = apps
+
+    # Optional: if your file includes direct user-app rows (even when group is blank),
+    # you can include them as well:
+    ua = df.dropna(subset=[user_col, app_col])[[user_col, app_col]].copy()
+    ua[user_col] = clean_str_series(ua[user_col])
+    ua[app_col] = clean_str_series(ua[app_col])
+    ua = ua[(ua[user_col] != "") & (ua[app_col] != "")]
+    for u, a in zip(ua[user_col], ua[app_col]):
+        user_apps.setdefault(u, set()).add(a)
+
+    return user_groups, group_apps, user_apps
+
+
+def build_app_combos_connected_components(user_apps: Dict[str, Set[str]]):
+    """
+    Build disjoint app combos under the constraint:
+      - an app can appear in only one combo
+      - if any user uses apps together, they must be in same combo
+
+    Returns:
+      app_to_component: app -> component_id (representative)
+      component_to_apps: component_id -> set(apps)
+    """
+    dsu = DSU()
+
+    # Register apps
+    all_apps = set()
+    for apps in user_apps.values():
+        for a in apps:
+            all_apps.add(a)
+            dsu.add(a)
+
+    # Union apps that co-occur for any user
+    for apps in user_apps.values():
+        apps_list = list(apps)
+        if len(apps_list) <= 1:
+            continue
+        base = apps_list[0]
+        for other in apps_list[1:]:
+            dsu.union(base, other)
+
+    # Build components
+    app_to_component = {}
+    component_to_apps: Dict[str, Set[str]] = {}
+    for a in all_apps:
+        root = dsu.find(a)
+        app_to_component[a] = root
+        component_to_apps.setdefault(root, set()).add(a)
+
+    return app_to_component, component_to_apps
+
+
+def assign_users_to_combos(
+    user_groups: Dict[str, Set[str]],
+    user_apps: Dict[str, Set[str]],
+    app_to_component: Dict[str, str]
+):
+    """
+    Each user should map to exactly one component, because all their apps co-occur via that user.
+    Users with zero apps are placed into a special combo "NO_APP".
+    """
+    user_to_combo = {}
+    combo_to_users: Dict[str, Set[str]] = {}
+
+    for u, apps in user_apps.items():
+        if not apps:
+            combo = "NO_APP"
+        else:
+            any_app = next(iter(apps))
+            combo = app_to_component.get(any_app)
+            if combo is None:
+                combo = "NO_APP"
+
+        user_to_combo[u] = combo
+        combo_to_users.setdefault(combo, set()).add(u)
+
+    return user_to_combo, combo_to_users
+
+
+def export_single_full_report(
+    output_csv: str,
+    component_to_apps: Dict[str, Set[str]],
+    combo_to_users: Dict[str, Set[str]],
+    user_apps: Dict[str, Set[str]],
+    user_groups: Dict[str, Set[str]]
+):
+    # Rank combos by user coverage desc; tie-break by apps_count asc; then by combo_id
+    combo_rows = []
+    for combo_id, users in combo_to_users.items():
+        apps = component_to_apps.get(combo_id, set()) if combo_id != "NO_APP" else set()
+        combo_rows.append((combo_id, len(users), len(apps)))
+
+    combo_rows.sort(key=lambda x: (-x[1], x[2], str(x[0])))
+
+    combo_rank_map = {combo_id: i + 1 for i, (combo_id, _, _) in enumerate(combo_rows)}
+
+    # Build output rows: one row per (combo, user)
+    out = []
+    for combo_id, users_count, apps_count in combo_rows:
+        rank = combo_rank_map[combo_id]
+        combo_apps = component_to_apps.get(combo_id, set()) if combo_id != "NO_APP" else set()
+        combo_apps_list = ",".join(sorted(combo_apps)) if combo_apps else ""
+
+        for u in sorted(combo_to_users.get(combo_id, set())):
+            ua = user_apps.get(u, set())
+            ug = user_groups.get(u, set())
+            out.append({
+                "combo_rank": rank,
+                "combo_id": combo_id,
+                "combo_users_count": users_count,
+                "combo_apps_count": apps_count,
+                "combo_apps_list": combo_apps_list,
+                "user": u,
+                "user_apps_list": ",".join(sorted(ua)) if ua else "",
+                "user_ad_groups_list": ",".join(sorted(ug)) if ug else "",
+            })
+
+    pd.DataFrame(out).to_csv(output_csv, index=False)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build disjoint app combos ranked by maximum exclusive user coverage (single CSV in, single CSV out)."
+    )
+    parser.add_argument("--input_csv", required=True, help="Path to your single input CSV.")
+    parser.add_argument("--output_csv", required=True, help="Path to the single output CSV.")
+    parser.add_argument("--user_col", default="user", help="User column name.")
+    parser.add_argument("--group_col", default="ad_group", help="AD group column name.")
+    parser.add_argument("--app_col", default="application", help="Application column name.")
+
+    args = parser.parse_args()
+
+    df = pd.read_csv(args.input_csv)
+    for c in [args.user_col, args.group_col, args.app_col]:
+        if c not in df.columns:
+            raise ValueError(f"Missing column '{c}'. Available columns: {list(df.columns)}")
+
+    user_groups, group_apps, user_apps = build_mappings_from_single_csv(
+        df=df,
+        user_col=args.user_col,
+        group_col=args.group_col,
+        app_col=args.app_col
+    )
+
+    app_to_component, component_to_apps = build_app_combos_connected_components(user_apps)
+    user_to_combo, combo_to_users = assign_users_to_combos(user_groups, user_apps, app_to_component)
+
+    # Ensure output directory exists
+    out_dir = os.path.dirname(os.path.abspath(args.output_csv))
+    if out_dir:
+        safe_mkdir(out_dir)
+
+    export_single_full_report(
+        output_csv=args.output_csv,
+        component_to_apps=component_to_apps,
+        combo_to_users=combo_to_users,
+        user_apps=user_apps,
+        user_groups=user_groups
+    )
+
+    print("SUCCESS: Single consolidated report exported.")
+    print(f"Input:  {args.input_csv}")
+    print(f"Output: {args.output_csv}")
+    print(f"Users:  {len(user_apps)}")
+    print(f"Combos: {len(combo_to_users)}")
+
+
+if __name__ == "__main__":
+    main()
