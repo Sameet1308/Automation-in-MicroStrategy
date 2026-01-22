@@ -1,0 +1,226 @@
+import os
+from typing import Dict, Set, List, Tuple
+import pandas as pd
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+INPUT_CSV_PATH = r"/path/to/your/input.csv"
+OUTPUT_CSV_PATH = r"/path/to/output/option2_execution_removals.csv"
+
+USER_COL = "user"
+GROUP_COL = "ad_group"
+APP_COL = "application"
+
+MAX_COMBOS = None          # None = no limit
+PREVIEW_ROWS = 25
+KEEP_ZERO_APP_USERS_AS_LEFTOVER = True
+# =========================
+
+
+def _safe_mkdir_for_file(filepath: str) -> None:
+    out_dir = os.path.dirname(os.path.abspath(filepath))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+
+def _clean_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip()
+
+
+def _build_user_groups_and_group_apps(df: pd.DataFrame) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    df = df[[USER_COL, GROUP_COL, APP_COL]].copy()
+
+    # user -> groups
+    ug = df.dropna(subset=[USER_COL, GROUP_COL])[[USER_COL, GROUP_COL]].copy()
+    ug[USER_COL] = _clean_series(ug[USER_COL])
+    ug[GROUP_COL] = _clean_series(ug[GROUP_COL])
+    ug = ug[(ug[USER_COL] != "") & (ug[GROUP_COL] != "")]
+    user_groups: Dict[str, Set[str]] = {}
+    for u, g in zip(ug[USER_COL], ug[GROUP_COL]):
+        user_groups.setdefault(u, set()).add(g)
+
+    # group -> apps
+    ga = df.dropna(subset=[GROUP_COL, APP_COL])[[GROUP_COL, APP_COL]].copy()
+    ga[GROUP_COL] = _clean_series(ga[GROUP_COL])
+    ga[APP_COL] = _clean_series(ga[APP_COL])
+    ga = ga[(ga[GROUP_COL] != "") & (ga[APP_COL] != "")]
+    group_apps: Dict[str, Set[str]] = {}
+    for g, a in zip(ga[GROUP_COL], ga[APP_COL]):
+        group_apps.setdefault(g, set()).add(a)
+
+    return user_groups, group_apps
+
+
+def _derive_user_apps(user_groups: Dict[str, Set[str]], group_apps: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+    # entitlement: user uses union of apps across all their groups
+    user_apps: Dict[str, Set[str]] = {}
+    for u, groups in user_groups.items():
+        apps = set()
+        for g in groups:
+            apps |= group_apps.get(g, set())
+        user_apps[u] = apps
+    return user_apps
+
+
+def _removable_users(users_subset: Set[str], user_apps: Dict[str, Set[str]], converted_apps: Set[str]) -> Set[str]:
+    return {u for u in users_subset if user_apps.get(u, set()).issubset(converted_apps)}
+
+
+def _pick_best_combo_by_true_gain(
+    remaining_users: Set[str],
+    user_apps: Dict[str, Set[str]],
+    converted_apps: Set[str]
+) -> Tuple[Set[str], int]:
+    """
+    Candidates = distinct Need(u) among remaining users, Need(u)=UserApps(u)-ConvertedApps.
+    Pick candidate S that maximizes NEW removable users after converting S.
+    Tie-break: fewer apps, then lexical.
+    """
+    candidates: Set[frozenset] = set()
+    for u in remaining_users:
+        need = frozenset(user_apps.get(u, set()) - converted_apps)
+        if need:
+            candidates.add(need)
+
+    if not candidates:
+        return set(), 0
+
+    current_removable = _removable_users(remaining_users, user_apps, converted_apps)
+
+    best_S = None
+    best_gain = -1
+
+    for S in candidates:
+        trial_converted = converted_apps.union(S)
+        trial_removable = _removable_users(remaining_users, user_apps, trial_converted)
+        gain = len(trial_removable) - len(current_removable)
+
+        if best_S is None:
+            best_S, best_gain = S, gain
+            continue
+
+        if (gain > best_gain) or \
+           (gain == best_gain and len(S) < len(best_S)) or \
+           (gain == best_gain and len(S) == len(best_S) and ",".join(sorted(S)) < ",".join(sorted(best_S))):
+            best_S, best_gain = S, gain
+
+    if best_S is None or best_gain <= 0:
+        return set(), 0
+
+    return set(best_S), best_gain
+
+
+def run():
+    if not os.path.exists(INPUT_CSV_PATH):
+        raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV_PATH}")
+
+    df = pd.read_csv(INPUT_CSV_PATH)
+    for c in [USER_COL, GROUP_COL, APP_COL]:
+        if c not in df.columns:
+            raise ValueError(f"Missing column '{c}'. Available columns: {list(df.columns)}")
+
+    user_groups, group_apps = _build_user_groups_and_group_apps(df)
+    user_apps = _derive_user_apps(user_groups, group_apps)
+
+    all_users = set(user_apps.keys())
+    remaining_users = set(all_users)
+    converted_apps: Set[str] = set()
+
+    zero_app_users = {u for u in remaining_users if len(user_apps.get(u, set())) == 0}
+
+    combo_rank = 0
+    cumulative_removed = 0
+    rows = []
+
+    while True:
+        if MAX_COMBOS is not None and combo_rank >= MAX_COMBOS:
+            break
+
+        selectable_users = set(remaining_users)
+        if KEEP_ZERO_APP_USERS_AS_LEFTOVER:
+            selectable_users -= zero_app_users
+
+        if not selectable_users:
+            break
+
+        combo_apps, _gain = _pick_best_combo_by_true_gain(selectable_users, user_apps, converted_apps)
+        if not combo_apps:
+            break
+
+        combo_rank += 1
+        combo_apps_list = ",".join(sorted(combo_apps))
+
+        # Snapshot need before conversion
+        need_before = {u: sorted(list(user_apps.get(u, set()) - converted_apps)) for u in selectable_users}
+
+        # Convert
+        converted_apps |= combo_apps
+
+        # EXECUTION ACCURATE: remove ALL users now fully covered
+        removable_now = _removable_users(selectable_users, user_apps, converted_apps)
+        removed_this_combo = sorted(list(removable_now))
+        if len(removed_this_combo) == 0:
+            break
+
+        remaining_users -= set(removed_this_combo)
+        cumulative_removed += len(removed_this_combo)
+
+        for u in removed_this_combo:
+            rows.append({
+                "combo_rank": combo_rank,
+                "combo_apps_list": combo_apps_list,
+                "combo_apps_count": len(combo_apps),
+                "combo_users_removed_in_this_combo": len(removed_this_combo),
+                "cumulative_users_removed": cumulative_removed,
+                "user": u,
+                "user_apps_list": ",".join(sorted(user_apps.get(u, set()))),
+                "user_need_before_combo": ",".join(need_before.get(u, [])),
+                "user_ad_groups_list": ",".join(sorted(user_groups.get(u, set()))),
+                "status": "REMOVED",
+                "leftover_reason": ""
+            })
+
+    # Leftovers
+    for u in sorted(list(remaining_users)):
+        apps = user_apps.get(u, set())
+        if len(apps) == 0:
+            reason = "No applications derived from group mappings (likely missing group->app mapping in data)."
+        else:
+            reason = "Left after plan; would require converting additional remaining apps."
+
+        rows.append({
+            "combo_rank": "",
+            "combo_apps_list": "",
+            "combo_apps_count": "",
+            "combo_users_removed_in_this_combo": "",
+            "cumulative_users_removed": cumulative_removed,
+            "user": u,
+            "user_apps_list": ",".join(sorted(apps)),
+            "user_need_before_combo": ",".join(sorted(list(apps - converted_apps))),
+            "user_ad_groups_list": ",".join(sorted(user_groups.get(u, set()))),
+            "status": "LEFTOVER",
+            "leftover_reason": reason
+        })
+
+    out_df = pd.DataFrame(rows)
+    _safe_mkdir_for_file(OUTPUT_CSV_PATH)
+    out_df.to_csv(OUTPUT_CSV_PATH, index=False)
+
+    print("\n===== OPTION 2 (EXECUTION ACCURATE) =====")
+    print(f"Output: {OUTPUT_CSV_PATH}")
+    print(f"Combos generated: {combo_rank}")
+    print(f"Total users: {len(all_users)}")
+    print(f"Removed users: {cumulative_removed}")
+    print(f"Leftover users: {len(all_users) - cumulative_removed}")
+    print(f"Total apps converted: {len(converted_apps)}")
+    if not out_df.empty:
+        pd.set_option("display.max_colwidth", 80)
+        pd.set_option("display.width", 220)
+        print("\nPreview:")
+        print(out_df.head(PREVIEW_ROWS).to_string(index=False))
+        print("\nHow to use: filter combo_rank = 1 to get the exact removable user list after combo 1.")
+
+
+if __name__ == "__main__":
+    run()
