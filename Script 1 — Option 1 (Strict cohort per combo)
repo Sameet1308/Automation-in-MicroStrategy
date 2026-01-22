@@ -1,0 +1,177 @@
+import os
+from typing import Dict, Set, List, Tuple
+import pandas as pd
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+INPUT_CSV_PATH = r"/path/to/your/input.csv"
+OUTPUT_CSV_PATH = r"/path/to/output/option1_strict_cohort_report.csv"
+
+USER_COL = "user"
+GROUP_COL = "ad_group"
+APP_COL = "application"
+
+MAX_COMBOS = None          # None = no limit
+PREVIEW_ROWS = 25
+KEEP_ZERO_APP_USERS_AS_LEFTOVER = True
+# =========================
+
+
+def _safe_mkdir_for_file(filepath: str) -> None:
+    out_dir = os.path.dirname(os.path.abspath(filepath))
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+
+def _clean_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip()
+
+
+def _build_user_groups_and_group_apps(df: pd.DataFrame) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    df = df[[USER_COL, GROUP_COL, APP_COL]].copy()
+
+    # user -> groups
+    ug = df.dropna(subset=[USER_COL, GROUP_COL])[[USER_COL, GROUP_COL]].copy()
+    ug[USER_COL] = _clean_series(ug[USER_COL])
+    ug[GROUP_COL] = _clean_series(ug[GROUP_COL])
+    ug = ug[(ug[USER_COL] != "") & (ug[GROUP_COL] != "")]
+    user_groups: Dict[str, Set[str]] = {}
+    for u, g in zip(ug[USER_COL], ug[GROUP_COL]):
+        user_groups.setdefault(u, set()).add(g)
+
+    # group -> apps
+    ga = df.dropna(subset=[GROUP_COL, APP_COL])[[GROUP_COL, APP_COL]].copy()
+    ga[GROUP_COL] = _clean_series(ga[GROUP_COL])
+    ga[APP_COL] = _clean_series(ga[APP_COL])
+    ga = ga[(ga[GROUP_COL] != "") & (ga[APP_COL] != "")]
+    group_apps: Dict[str, Set[str]] = {}
+    for g, a in zip(ga[GROUP_COL], ga[APP_COL]):
+        group_apps.setdefault(g, set()).add(a)
+
+    return user_groups, group_apps
+
+
+def _derive_user_apps(user_groups: Dict[str, Set[str]], group_apps: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
+    # entitlement: user uses union of apps across all their groups
+    user_apps: Dict[str, Set[str]] = {}
+    for u, groups in user_groups.items():
+        apps = set()
+        for g in groups:
+            apps |= group_apps.get(g, set())
+        user_apps[u] = apps
+    return user_apps
+
+
+def run():
+    if not os.path.exists(INPUT_CSV_PATH):
+        raise FileNotFoundError(f"Input CSV not found: {INPUT_CSV_PATH}")
+
+    df = pd.read_csv(INPUT_CSV_PATH)
+    for c in [USER_COL, GROUP_COL, APP_COL]:
+        if c not in df.columns:
+            raise ValueError(f"Missing column '{c}'. Available columns: {list(df.columns)}")
+
+    user_groups, group_apps = _build_user_groups_and_group_apps(df)
+    user_apps = _derive_user_apps(user_groups, group_apps)
+
+    all_users = set(user_apps.keys())
+    remaining_users = set(all_users)
+    converted_apps: Set[str] = set()
+
+    zero_app_users = {u for u in remaining_users if len(user_apps.get(u, set())) == 0}
+
+    combo_rank = 0
+    rows = []
+
+    while True:
+        if MAX_COMBOS is not None and combo_rank >= MAX_COMBOS:
+            break
+
+        selectable_users = set(remaining_users)
+        if KEEP_ZERO_APP_USERS_AS_LEFTOVER:
+            selectable_users -= zero_app_users
+
+        if not selectable_users:
+            break
+
+        # Compute Needs for selectable users
+        need_map: Dict[str, frozenset] = {}
+        need_to_users: Dict[frozenset, List[str]] = {}
+        for u in selectable_users:
+            need = frozenset(user_apps.get(u, set()) - converted_apps)
+            need_map[u] = need
+            if need:
+                need_to_users.setdefault(need, []).append(u)
+
+        if not need_to_users:
+            break
+
+        # Pick the Need-set with max user count (strict cohort definition)
+        # Tie-break: smaller app set, then lexical
+        def key(item):
+            need_set, users = item
+            return (-len(users), len(need_set), ",".join(sorted(need_set)))
+
+        chosen_need, cohort_users = sorted(need_to_users.items(), key=key)[0]
+        cohort_users = sorted(cohort_users)
+        combo_apps = set(chosen_need)
+
+        combo_rank += 1
+        combo_apps_list = ",".join(sorted(combo_apps))
+
+        # Convert these apps (so apps won't repeat in later combos)
+        converted_apps |= combo_apps
+
+        # STRICT: remove only cohort users (exact-match), not incidental users
+        for u in cohort_users:
+            rows.append({
+                "combo_rank": combo_rank,
+                "combo_apps_list": combo_apps_list,
+                "combo_apps_count": len(combo_apps),
+                "combo_cohort_users_count": len(cohort_users),
+                "user": u,
+                "user_apps_list": ",".join(sorted(user_apps.get(u, set()))),
+                "user_need_before_combo": ",".join(sorted(list(need_map.get(u, frozenset())))),
+                "user_ad_groups_list": ",".join(sorted(user_groups.get(u, set()))),
+                "status": "COHORT"
+            })
+
+        # Remove cohort users from further consideration
+        remaining_users -= set(cohort_users)
+
+    # Leftovers (users not assigned to any strict cohort)
+    for u in sorted(list(remaining_users)):
+        apps = user_apps.get(u, set())
+        status = "LEFTOVER"
+        rows.append({
+            "combo_rank": "",
+            "combo_apps_list": "",
+            "combo_apps_count": "",
+            "combo_cohort_users_count": "",
+            "user": u,
+            "user_apps_list": ",".join(sorted(apps)),
+            "user_need_before_combo": ",".join(sorted(list(apps - converted_apps))),
+            "user_ad_groups_list": ",".join(sorted(user_groups.get(u, set()))),
+            "status": status
+        })
+
+    out_df = pd.DataFrame(rows)
+    _safe_mkdir_for_file(OUTPUT_CSV_PATH)
+    out_df.to_csv(OUTPUT_CSV_PATH, index=False)
+
+    print("\n===== OPTION 1 (STRICT COHORT) =====")
+    print(f"Output: {OUTPUT_CSV_PATH}")
+    print(f"Combos generated: {combo_rank}")
+    print(f"Total users: {len(all_users)}")
+    print(f"Cohort users listed: {len(out_df[out_df['status']=='COHORT']) if not out_df.empty else 0}")
+    print(f"Leftover users listed: {len(out_df[out_df['status']=='LEFTOVER']) if not out_df.empty else 0}")
+    if not out_df.empty:
+        pd.set_option("display.max_colwidth", 80)
+        pd.set_option("display.width", 220)
+        print("\nPreview:")
+        print(out_df.head(PREVIEW_ROWS).to_string(index=False))
+
+
+if __name__ == "__main__":
+    run()
